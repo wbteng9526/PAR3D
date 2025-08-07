@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from utils.drop_path import DropPath
+from tokenizer.vidtok.modules.model_3dcausal import EncoderCausal3DPadding
 
 
 def find_multiple(n: int, k: int):
@@ -50,6 +51,28 @@ class ModelArgs:
     max_seq_len: int = 2048
     spe_token_num: int = 3
     ar_token_num: int = 4
+
+    # token permutation
+    num_views: int = 4
+    temporal_size: int = 4
+    downsample_size: int = 8
+    image_size: int = 256
+    ar_token_num: int = 16
+
+    # camera causal encoder
+    double_z: bool = False
+    in_channels: int = 6
+    out_ch: int = 6
+    ch: int = 128
+    ch_mult: list[int] = [1, 2, 4, 4]
+    time_downsample_factor: int = 4
+    num_res_blocks: int = 2
+    dropout: float = 0.0
+    use_checkpoint: bool = False
+    init_pad_mode: str = "replicate"
+    norm_type: str = "layernorm"
+    fix_encoder: bool = False
+    fix_decoder: bool = False
 
 
 #################################################################################
@@ -252,6 +275,7 @@ class Transformer(nn.Module):
         self.cls_token_num = config.cls_token_num
         self.spe_token_num = config.spe_token_num
         self.ar_token_num = config.ar_token_num
+        self.num_views = config.num_views
 
        
         self.cls_embedding = ImageEmbedder(config.image_dim, config.dim, config.class_dropout_prob)
@@ -260,6 +284,24 @@ class Transformer(nn.Module):
         self.tok_dropout = nn.Dropout(config.token_dropout_p)
 
         self.spe_tok_embeddings = SpecialTokenEmbedding(self.spe_token_num, config.dim)
+
+        # camera causal encoder
+        self.camera_encoder = EncoderCausal3DPadding(
+            double_z=config.double_z,
+            z_channels=config.dim,
+            in_channels=config.in_channels,
+            out_ch=config.out_ch,
+            ch=config.ch,
+            ch_mult=config.ch_mult,
+            time_downsample_factor=config.time_downsample_factor,
+            num_res_blocks=config.num_res_blocks,
+            dropout=config.dropout,
+            use_checkpoint=config.use_checkpoint,
+            init_pad_mode=config.init_pad_mode,
+            norm_type=config.norm_type,
+            fix_encoder=config.fix_encoder,
+            fix_decoder=config.fix_decoder,
+        )
 
 
         # transformer blocks
@@ -273,18 +315,30 @@ class Transformer(nn.Module):
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         # 2d rotary pos embedding
-        grid_size = int(self.block_size ** 0.5)
-        assert grid_size * grid_size == self.block_size
-        self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num, spe_token_num=self.spe_token_num, ar_token_num=self.ar_token_num)
+        grid_size = int((self.block_size // self.num_views) ** 0.5)
+        assert grid_size * grid_size == self.block_size // self.num_views
+        # Create freqs_cis for interleaved camera and idx tokens
+        self.freqs_cis = precompute_freqs_cis_3d(
+            self.config.num_views, 
+            grid_size, 
+            self.config.dim // self.config.n_head, 
+            self.config.rope_base, 
+            self.cls_token_num, 
+            spe_token_num=self.spe_token_num, 
+            ar_token_num=2*self.ar_token_num  # Double ar_token_num for interleaved tokens
+        )
         
         max_len = self.freqs_cis.shape[0]
-        group_mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))
+        # Account for interleaved camera and idx tokens (doubled sequence length)
+        doubled_max_len = self.cls_token_num + 2 * (max_len - self.cls_token_num - self.spe_token_num) + self.spe_token_num
+        group_mask = torch.tril(torch.ones(doubled_max_len, doubled_max_len, dtype=torch.bool))
         group_mask[:, 0] = True
         group_size = self.spe_token_num + 1
         
-        for i in range(0, max_len // group_size):
-            start = self.ar_token_num + i * group_size
-            end = start + group_size
+        # Adjust group mask construction for interleaved tokens
+        for i in range(0, (doubled_max_len - self.cls_token_num - self.spe_token_num) // (2 * group_size)):
+            start = self.cls_token_num + 2 * self.ar_token_num + i * (2 * group_size)
+            end = start + 2 * group_size
             group_mask[start:end, :end] = True
         self.group_mask = group_mask
 
@@ -314,30 +368,38 @@ class Transformer(nn.Module):
         # if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
         #     return
         head_dim = self.config.dim // self.config.n_head
-        max_seq_length = find_multiple(max_seq_length, 8)
-        self.max_seq_length = max_seq_length
+        # Account for doubled sequence length due to interleaved camera and idx tokens
+        doubled_max_seq_length = max_seq_length * 2
+        doubled_max_seq_length = find_multiple(doubled_max_seq_length, 8)
+        self.max_seq_length = doubled_max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim, dtype)
+            b.attention.kv_cache = KVCache(max_batch_size, doubled_max_seq_length, self.config.n_head, head_dim, dtype)
 
-        group_mask = torch.tril(torch.ones(self.max_seq_length,  self.max_seq_length, dtype=torch.bool))
+        group_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
         group_mask[:, 0] = True
         group_size = self.spe_token_num + 1
-        for i in range(0, self.max_seq_length // group_size):
-            start = i * group_size + self.ar_token_num
-            end = start + group_size
-            group_mask[start:end, :end] = True
+        # Adjust for interleaved tokens in cache setup
+        for i in range(0, (self.max_seq_length - self.cls_token_num - self.spe_token_num) // (2 * group_size)):
+            start = self.cls_token_num + 2 * self.ar_token_num + i * (2 * group_size)
+            end = start + 2 * group_size
+            if end <= self.max_seq_length:
+                group_mask[start:end, :end] = True
         self.causal_mask = group_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
         
         # causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
         # self.causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-        grid_size = int(self.config.block_size ** 0.5)
-        assert grid_size * grid_size == self.block_size
-        self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num, spe_token_num = self.spe_token_num, ar_token_num=self.ar_token_num)
+        grid_size = int((self.config.block_size // self.config.num_views) ** 0.5)
+        assert grid_size * grid_size == self.block_size // self.num_views
+        # Create freqs_cis for doubled sequence length (interleaved camera and idx tokens)
+        self.freqs_cis = precompute_freqs_cis_3d(self.config.num_views, grid_size, self.config.dim // self.config.n_head, self.config.rope_base, 
+                                                  self.cls_token_num, spe_token_num=self.spe_token_num, 
+                                                  ar_token_num=2*self.ar_token_num)  # Double ar_token_num for interleaved tokens
 
     def forward(
         self, 
         idx: torch.Tensor, 
+        cam: torch.Tensor,
         cond_idx: torch.Tensor,  # cond_idx_or_embed
         input_pos:  Optional[torch.Tensor] = None, 
         targets: Optional[torch.Tensor] = None,
@@ -345,45 +407,68 @@ class Transformer(nn.Module):
         valid: Optional[torch.Tensor] = None,
     ):
         if idx is not None and cond_idx is not None: # training or naive inference
+            # Process camera tensor through camera encoder
+            cam_encoded = self.camera_encoder(cam)
+            b, dim, v, h, w = cam_encoded.shape
+            cam_encoded = cam_encoded.view(b, v, h, w, dim)  # b x v x h x w x dim
+            
+            # Apply same permutation as idx to camera tokens
+            cam_tokens = permute_token(cam_encoded, self.config)    
+            
+            idx = permute_token(idx, self.config)[:,:-1] # remove last token
             cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
             token_embeddings = self.tok_embeddings(idx)
             spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(cond_embeddings.shape[0], -1, -1)
-            # token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
-            token_embeddings_first, token_embeddings_last = token_embeddings[:,:self.ar_token_num], token_embeddings[:,self.ar_token_num:]
-            token_embeddings = torch.cat((cond_embeddings, token_embeddings_first, spe_embeddings, token_embeddings_last), dim=1)
+
+            # interleave camera tokens with idx tokens
+            interleaved_tokens = interleave_tokens(cam_tokens, token_embeddings) # b x (2*seq_len) x dim
+
+            # interleave special tokens
+            interleaved_spe_tokens = interleave_tokens(spe_embeddings, spe_embeddings)
+            
+            # Split interleaved tokens for special token insertion
+            token_embeddings_first, token_embeddings_last = interleaved_tokens[:,:2*self.ar_token_num], interleaved_tokens[:,2*self.ar_token_num:]
+            token_embeddings = torch.cat((cond_embeddings, token_embeddings_first, interleaved_spe_tokens, token_embeddings_last), dim=1)
             h = self.tok_dropout(token_embeddings)
 
-            mask = self.group_mask[:token_embeddings.shape[1], :token_embeddings.shape[1]]
+            # Update mask for doubled sequence length
+            doubled_seq_len = token_embeddings.shape[1]
+            mask = self.group_mask[:doubled_seq_len, :doubled_seq_len]
             batch_size = cond_embeddings.shape[0]
             mask = mask.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
             mask = mask.to(h.device)
 
-            self.freqs_cis = self.freqs_cis.to(h.device)
+            token_freqs_cis = interleave_tokens(self.freqs_cis, self.freqs_cis)
+            token_freqs_cis = token_freqs_cis.to(h.device)
+
+            if self.training and targets is None:
+                targets = idx
         else:
-            if cond_idx is not None: # prefill in inference
-                self.start = False
-                token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
-                # spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
-                # token_embeddings = torch.cat((token_embeddings, spe_embeddings), dim=1)
-            else: # decode_n_tokens(kv cache) in inferenceå
-                if idx.shape[1]>1 and not self.start:
-                    token_embeddings = self.tok_embeddings(idx)
-                    spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
-                    token_embeddings = torch.cat((token_embeddings[:,-1:], spe_embeddings), dim=1)
-                    # token_embeddings = spe_embeddings.to(token_embeddings.device)
-                    self.start = True
-                else:
-                    token_embeddings = self.tok_embeddings(idx)
+            # if cond_idx is not None: # prefill in inference
+            #     self.start = False
+            #     token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
+            #     # spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
+            #     # token_embeddings = torch.cat((token_embeddings, spe_embeddings), dim=1)
+            # else: # decode_n_tokens(kv cache) in inferenceå
+            #     if idx.shape[1]>1 and not self.start:
+            #         token_embeddings = self.tok_embeddings(idx)
+            #         spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
+            #         token_embeddings = torch.cat((token_embeddings[:,-1:], spe_embeddings), dim=1)
+            #         # token_embeddings = spe_embeddings.to(token_embeddings.device)
+            #         self.start = True
+            #     else:
+            #         token_embeddings = self.tok_embeddings(idx)
             
-            bs = token_embeddings.shape[0]
-            mask = self.causal_mask[:bs, None, input_pos]
-            h = self.tok_dropout(token_embeddings)
-            self.freqs_cis = self.freqs_cis
+            # bs = token_embeddings.shape[0]
+            # mask = self.causal_mask[:bs, None, input_pos]
+            # h = self.tok_dropout(token_embeddings)
+            # self.freqs_cis = self.freqs_cis
+            raise ValueError("Not implemented")
         
         if self.training:
-            freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
+            freqs_cis = token_freqs_cis[:token_embeddings.shape[1]]
         else:
-            freqs_cis = self.freqs_cis[input_pos]
+            freqs_cis = token_freqs_cis[input_pos]
         # transformer blocks
         for layer in self.layers:
             h = layer(h, freqs_cis, input_pos, mask)
@@ -393,8 +478,11 @@ class Transformer(nn.Module):
         logits = self.output(h).float()
         
         if self.training:
-            # logits = logits[:, self.cls_token_num - 1:].contiguous()
-            logits = logits[:, self.cls_token_num -1 : self.cls_token_num -1 + self.block_size].contiguous()
+            # Extract logits only for idx token positions (skip camera tokens)
+            # Pattern: [cond_tokens] [c0, idx0, c1, idx1, ...] -> extract idx0, idx1, ...
+            start_idx = self.cls_token_num - 1
+            # Select only the idx token positions from interleaved sequence
+            logits = logits[:, start_idx:start_idx + self.block_size:2].contiguous()
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -425,7 +513,6 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000, cls_token
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1) # (cls_token_num+seq_len, head_dim // 2, 2)
     cond_cache = torch.cat([torch.zeros(cls_token_num, n_elem // 2, 2), cache]) # (cls_token_num+seq_len, head_dim // 2, 2)
     return cond_cache 
-
 
 def precompute_freqs_cis_2d(grid_size: int, n_elem: int, base: int = 10000, cls_token_num=120, spe_token_num=3, ar_token_num=4):
     # split the dimension into half, one for x and one for y
@@ -487,7 +574,6 @@ def precompute_freqs_cis_3d(num_views: int, grid_size: int, n_elem: int, base: i
     cond_cache = torch.cat([torch.zeros(cls_token_num, n_elem // 2, 2), cache_one, sep_cache, cache_two])
     return cond_cache
 
-
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     # x: (bs, seq_len, n_head, head_dim)
     # freqs_cis (seq_len, head_dim // 2, 2)
@@ -500,6 +586,58 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
 
+def permute_token(x, args):
+    """
+    Dynamically permute tokens for 3D autoregressive modeling.
+    Supports variable input dimensions beyond [b, t, h, w].
+    
+    Args:
+        x: Input tensor with shape [b, t, h, w, ...] where ... represents optional extra dimensions
+        args: Configuration object containing permutation parameters
+    
+    Returns:
+        Permuted tensor with shape [b, -1, ...] where ... preserves any extra dimensions
+    """
+    if len(x.shape) < 4:
+        raise ValueError(f"Input tensor must have at least 4 dimensions, got {len(x.shape)}")
+    
+    latent_size = args.image_size // args.downsample_size
+    sub_num = int(args.ar_token_num**0.5)
+    
+    # Extract core dimensions and extra dimensions
+    batch_size = x.shape[0]
+    extra_dims = x.shape[4:] if len(x.shape) > 4 else ()
+    
+    # Flatten to [b, t*h*w, ...]
+    z = x.reshape(batch_size, -1, *extra_dims)
+    
+    # Reshape to [b, t, h, w, ...]
+    z = z.reshape(batch_size, args.temporal_size, latent_size, latent_size, *extra_dims)
+    
+    # Reshape to [b, t, s, h//s, s, w//s, ...]
+    z = z.reshape(batch_size, args.temporal_size, sub_num, latent_size//sub_num, sub_num, latent_size//sub_num, *extra_dims)
+    
+    # Create dynamic permutation indices
+    # Core permutation: [b, t, s, h//s, s, w//s] -> [b, h//s, w//s, t, s, s]
+    core_perm = [0, 3, 5, 1, 2, 4]
+    # Add indices for extra dimensions (they stay in place after the core permutation)
+    extra_perm = list(range(6, 6 + len(extra_dims)))
+    perm_indices = core_perm + extra_perm
+    
+    # Apply permutation
+    z = z.permute(*perm_indices)
+    
+    # Reshape to [b, -1, ...]
+    z = z.reshape(batch_size, -1, *extra_dims)
+    
+    return z
+
+def interleave_tokens(seq1, seq2):
+    """ Interleave two sequences """
+    result = torch.zeros_like(torch.cat((seq1, seq2), dim=1))
+    result[:, ::2] = seq1
+    result[:, 1::2] = seq2
+    return result
 
 
 #################################################################################

@@ -8,3 +8,4 @@
 - [x] Convert to 3D positional encoding
 - [ ] (Optional for now) Add history
 - [x] Add CLIP embedding for first image
+- [x] Add mixed precision

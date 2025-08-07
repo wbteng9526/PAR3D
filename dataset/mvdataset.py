@@ -1,4 +1,5 @@
 import torch
+from einops import rearrange
 from pathlib import Path
 import os
 import json
@@ -6,6 +7,7 @@ from torch.utils.data import Dataset
 import numpy as np
 from transformers import CLIPImageProcessor
 from PIL import Image
+from utils.geometry import get_plucker_coordinates
 
 DL3DV_SCALE = 4
 
@@ -18,6 +20,7 @@ class MultiViewDataset(Dataset):
             self.global_index = [line.strip() for line in f.readlines()]
         
         self.feature_extractor = CLIPImageProcessor.from_pretrained(args.clip_ckpt)
+        self.image_size = args.image_size
     
     def __len__(self):
         return len(self.global_index)
@@ -32,10 +35,23 @@ class MultiViewDataset(Dataset):
         indices = torch.from_numpy(np.load(indices_file)).float()
 
         extrinsics, intrinsics = self.process_transform_json(transform_file, dataset_name)
-        camera_matrix = torch.cat([extrinsics[:, :3, :], intrinsics], dim=-1)
+        # get plucker coordinates (ray embeddings)
+        extrinsics_src = extrinsics[0]
+        c2w_src = torch.linalg.inv(extrinsics_src)
+        # transform coordinates from the source camera's coordinate system to the coordinate system of the respective camera
+        extrinsics_rel = torch.einsum(
+            "vnm,vmp->vnp", extrinsics, c2w_src[None].repeat(extrinsics.shape[0], 1, 1)
+        )
+        plucker_coords = get_plucker_coordinates(
+                extrinsics_src,
+                extrinsics,
+                intrinsics,
+                self.image_size
+        )
+        # camera_matrix = torch.cat([extrinsics[:, :3, :], intrinsics], dim=-1)
         clip_input = self.feature_extractor(image=Image.open(first_image_file).convert("RGB"), return_tensors="pt").pixel_values[0]
 
-        return indices, camera_matrix, clip_input
+        return indices, plucker_coords, clip_input
 
     def process_transform_json(self, filename: Path, dataset_name: str):
         with open(filename, 'r') as f:

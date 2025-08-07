@@ -114,7 +114,6 @@ def main(args):
         vocab_size=args.vocab_size,
         block_size=latent_size ** 2 * args.temporal_size,
         cls_token_num=args.cls_token_num,
-        model_type=args.gpt_type,
         resid_dropout_p=dropout_p,
         ffn_dropout_p=dropout_p,
         drop_path_rate=args.drop_path_rate,
@@ -207,14 +206,15 @@ def main(args):
             # z: [b, t, h, w]
             # z: [b, t, s, h//s, s, w//s]
 
-            z_indices = x.reshape(x.shape[0], -1)
-            z_indices = z_indices.reshape(x.shape[0], args.temporal_size, latent_size, latent_size)
-            z_indices = z_indices.reshape(x.shape[0], args.temporal_size, sub_num, latent_size//sub_num, sub_num, latent_size//sub_num)
-            z_indices = z_indices.permute(0, 3, 5, 1, 2, 4) # [b, t, s, h//s, s, w//s] -> [b, h//s, w//s, t, s, s]
-            z_indices = z_indices.reshape(z_indices.shape[0], -1)
-            assert z_indices.shape[0] == cond_input.shape[0]
+            # z_indices = x.reshape(x.shape[0], -1)
+            # z_indices = z_indices.reshape(x.shape[0], args.temporal_size, latent_size, latent_size)
+            # z_indices = z_indices.reshape(x.shape[0], args.temporal_size, sub_num, latent_size//sub_num, sub_num, latent_size//sub_num)
+            # z_indices = z_indices.permute(0, 3, 5, 1, 2, 4) # [b, t, s, h//s, s, w//s] -> [b, h//s, w//s, t, s, s]
+            # z_indices = z_indices.reshape(z_indices.shape[0], -1)
+            # assert z_indices.shape[0] == cond_input.shape[0]
             with torch.cuda.amp.autocast(dtype=ptdtype):  
-                _, loss = model(cond_idx=cond_input, idx=z_indices[:,:-1], targets=z_indices)
+                # _, loss = model(cond_idx=cond_input, idx=z_indices[:,:-1], targets=z_indices)
+                _, loss = model(cond_idx=cond_input, idx=x)
             # backward pass, with gradient scaling if training in fp16         
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
@@ -285,14 +285,17 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--code-path", type=str, required=True)
+    # mv dataset
+    parser.add_argument("--data-path", type=str, required=True, help='path to the mv dataset')
+    parser.add_argument("--global-index-file", type=str, required=True, help='path to the global index file')
+    parser.add_argument("--clip-ckpt", type=str, default="openai/clip-vit-base-patch32")
+    # training
     parser.add_argument("--cloud-save-path", type=str, required=True, help='please specify a cloud disk path, if not, local path')
     parser.add_argument("--no-local-save", action='store_true', help='no save checkpoints to local path for limited disk volume')
     parser.add_argument("--spe-token-num", type=int, default=15, help='number of learnable tokens')
     parser.add_argument("--ar-token-num", type=int, default=16, help='number of parallel prediction tokens')
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
     parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
-    parser.add_argument("--gpt-type", type=str, choices=['c2i', 't2i'], default="c2i", help="class-conditional or text-conditional")
     parser.add_argument("--vocab-size", type=int, default=6, help="vocabulary size of visual tokenizer")
     parser.add_argument("--ema", action='store_true', help="whether using ema training")
     parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
