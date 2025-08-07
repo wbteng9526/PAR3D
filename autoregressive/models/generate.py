@@ -175,23 +175,23 @@ def decode_n_tokens_multi(
 
 
 @torch.no_grad()
-def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, ar_token_num=4, spe_token_num=3, **sampling_kwargs):
-    if model.model_type == 'c2i':
-        if cfg_scale > 1.0:
-            cond_null = torch.ones_like(cond) * model.num_classes
-            cond_combined = torch.cat([cond, cond_null])
-        else:
-            cond_combined = cond
-        T = 1
-    elif model.model_type == 't2i':
-        if cfg_scale > 1.0:
-            cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
-            cond_combined = torch.cat([cond, cond_null])
-        else:
-            cond_combined = cond
-        T = cond.shape[1]      
+def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, ar_token_num=16, spe_token_num=15, **sampling_kwargs):
+    # if model.model_type == 'c2i':
+    #     if cfg_scale > 1.0:
+    #         cond_null = torch.ones_like(cond) * model.num_classes
+    #         cond_combined = torch.cat([cond, cond_null])
+    #     else:
+    #         cond_combined = cond
+    #     T = 1
+    # elif model.model_type == 't2i':
+    if cfg_scale > 1.0:
+        cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
+        cond_combined = torch.cat([cond, cond_null])
     else:
-        raise Exception("please check model type")
+        cond_combined = cond
+    T = cond.shape[1]      
+    # else:
+    #     raise Exception("please check model type")
 
     T_new = T + max_new_tokens
     max_seq_length = T_new
