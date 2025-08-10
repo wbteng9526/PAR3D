@@ -1,6 +1,11 @@
 # Modified from:
 #   fast-DiT: https://github.com/chuanyangjin/fast-DiT/blob/main/train.py
 #   nanoGPT: https://github.com/karpathy/nanoGPT/blob/master/model.py
+import sys
+import os
+# Add the project root to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -10,7 +15,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from glob import glob
 from copy import deepcopy
-import os
 import time
 import inspect
 import argparse
@@ -110,6 +114,8 @@ def main(args):
     else:
         dropout_p = args.dropout_p
     latent_size = args.image_size // args.downsample_size
+    # logger.info(f"The latent size is: {latent_size}")
+    # logger.info(f"The block size is: {latent_size ** 2 * args.temporal_size}")
     model = GPT_models[args.gpt_model](
         vocab_size=args.vocab_size,
         block_size=latent_size ** 2 * args.temporal_size,
@@ -200,7 +206,9 @@ def main(args):
             x, cam, clip_input = x.to(device, non_blocking=True), cam.to(device, non_blocking=True), clip_input.to(device, non_blocking=True)
             cond_input = clip_model(clip_input).image_embeds
             ar_token_num = args.ar_token_num
-            sub_num = int(ar_token_num**0.5)
+            # logger.info(f"The shape of input x is: {x.shape}")
+            # logger.info(f"The shape of input cam is: {cam.shape}")
+            # logger.info(f"The shape of input cond_input is: {cond_input.shape}")
             # x: [b, t, h, w]
             # z: [b, t * h * w]
             # z: [b, t, h, w]
@@ -212,9 +220,10 @@ def main(args):
             # z_indices = z_indices.permute(0, 3, 5, 1, 2, 4) # [b, t, s, h//s, s, w//s] -> [b, h//s, w//s, t, s, s]
             # z_indices = z_indices.reshape(z_indices.shape[0], -1)
             # assert z_indices.shape[0] == cond_input.shape[0]
+      
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 # _, loss = model(cond_idx=cond_input, idx=z_indices[:,:-1], targets=z_indices)
-                _, loss = model(cond_idx=cond_input, idx=x)
+                _, loss = model(cond_idx=cond_input, idx=x, cam=cam)
             # backward pass, with gradient scaling if training in fp16         
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
@@ -296,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument("--ar-token-num", type=int, default=16, help='number of parallel prediction tokens')
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
     parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
-    parser.add_argument("--vocab-size", type=int, default=6, help="vocabulary size of visual tokenizer")
+    parser.add_argument("--vocab-size", type=int, default=262144, help="vocabulary size of visual tokenizer")
     parser.add_argument("--ema", action='store_true', help="whether using ema training")
     parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
     parser.add_argument("--dropout-p", type=float, default=0.1, help="dropout_p of resid_dropout_p and ffn_dropout_p")
@@ -317,7 +326,7 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=24)
-    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 

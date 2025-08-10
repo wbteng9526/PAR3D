@@ -1,6 +1,11 @@
 # Modified from:
 #   fast-DiT: https://github.com/chuanyangjin/fast-DiT/blob/main/train.py
 #   nanoGPT: https://github.com/karpathy/nanoGPT/blob/master/model.py
+import sys
+import os
+# Add the project root to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -10,7 +15,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from glob import glob
 from copy import deepcopy
-import os
 import time
 import inspect
 import argparse

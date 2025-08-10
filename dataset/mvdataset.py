@@ -1,4 +1,5 @@
 import torch
+import torchvision.transforms as transforms
 from einops import rearrange
 from pathlib import Path
 import os
@@ -8,6 +9,7 @@ import numpy as np
 from transformers import CLIPImageProcessor
 from PIL import Image
 from utils.geometry import get_plucker_coordinates
+from augmentation import center_crop_arr
 
 DL3DV_SCALE = 4
 
@@ -30,9 +32,9 @@ class MultiViewDataset(Dataset):
         dataset_name = data_index.split("/")[0]
         indices_file = Path(self.root) / data_index / "indices.npy"
         transform_file = Path(self.root) / data_index / "transforms.json"
-        first_image_file = Path(self.root) / data_index / "frist_frame.png"
+        first_image_file = Path(self.root) / data_index / "first_frame.png"
 
-        indices = torch.from_numpy(np.load(indices_file)).float()
+        indices = torch.from_numpy(np.load(indices_file)).long()
 
         extrinsics, intrinsics = self.process_transform_json(transform_file, dataset_name)
         # get plucker coordinates (ray embeddings)
@@ -46,12 +48,12 @@ class MultiViewDataset(Dataset):
                 extrinsics_src,
                 extrinsics,
                 intrinsics,
-                self.image_size
+                [self.image_size, self.image_size]
         )
         # camera_matrix = torch.cat([extrinsics[:, :3, :], intrinsics], dim=-1)
-        clip_input = self.feature_extractor(image=Image.open(first_image_file).convert("RGB"), return_tensors="pt").pixel_values[0]
+        clip_input = self.feature_extractor(images=Image.open(first_image_file).convert("RGB"), return_tensors="pt").pixel_values[0]
 
-        return indices, plucker_coords, clip_input
+        return indices[1:], plucker_coords, clip_input
 
     def process_transform_json(self, filename: Path, dataset_name: str):
         with open(filename, 'r') as f:
@@ -97,4 +99,41 @@ class MultiViewDataset(Dataset):
         intrinsics = torch.stack(intrinsics)
         return extrinsics, intrinsics 
         
+
+class RE10KVideoEvalDataset(Dataset):
+    def __init__(self, args):
+        super().__init__()
+        self.data_dir = args.data_dir
+        self.evaluate_file = args.evaluate_file
+        with open(self.evaluate_file, 'r') as f:
+            self.data_list = json.load(f)
+        
+        self.index_file = args.index_file
+        with open(self.index_file, 'r') as f:
+            self.index_meta = json.load(f)
+        
+        self.scenes = self.data_list.keys()
+        self.num_frames = args.num_frames
+
+        self.transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+    
+    def __len__(self):
+        return len(self.scenes)
+    
+    def __getitem__(self, idx):
+        scene_name = self.scenes[idx]
+        scene_meta = self.data_list[scene_name]
+
+        scene_folder = self.index_meta[scene_name].split(".")[0]
+        
+        target_indices = scene_meta["target"]
+        context_indices = scene_meta["context"]
+
+        image_dir = Path(self.data_dir) / scene_folder / scene_name / "images"
+
+        first_frame = Image.open(image_dir / f"frame_{context_indices[0]:06d}.png")
     

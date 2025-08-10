@@ -1,5 +1,10 @@
 # Modified from:
 #   fast-DiT: https://github.com/chuanyangjin/fast-DiT/blob/main/extract_features.py
+import sys
+import os
+# Add the project root to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -9,7 +14,6 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 import numpy as np
 import argparse
-import os
 
 from utils.distributed import init_distributed_mode
 from dataset.augmentation import center_crop_arr
