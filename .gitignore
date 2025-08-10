@@ -15,6 +15,7 @@ core
 submodules/
 pretrained_checkpoints/
 config/global_index.txt
+.DS_Store
 
 # C extensions
 *.so
