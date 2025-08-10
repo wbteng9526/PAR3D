@@ -6,19 +6,31 @@ setattr(torch.nn.Linear, 'reset_parameters', lambda self: None)     # disable de
 setattr(torch.nn.LayerNorm, 'reset_parameters', lambda self: None)  # disable default parameter init for faster speed
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.data import DataLoader
+from transformers import CLIPVisionModelWithProjection
+from torchvision.io import write_video
 
 import os
+import numpy as np
 import math
 import json
 import argparse
 import pandas as pd
 from tqdm import tqdm
 from PIL import Image
+from einops import rearrange
+
+# metrics
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+import lpips                              # pip install lpips
+from torchmetrics.image.fid import FrechetInceptionDistance
 
 from tokenizer.vidtok.scripts.inference_evaluate import load_model_from_config
 from autoregressive.models.gpt import GPT_models
 from autoregressive.models.generate_3d import generate
+from dataset.mvdataset import RE10KVideoEvalDataset
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 
 
@@ -40,8 +52,15 @@ def main(args):
     tokenizer = load_model_from_config(args.tokenizer_config, args.tokenizer_ckpt)
     tokenizer.to(device)
     tokenizer.eval()
-
     print(f"video tokenizer is loaded")
+
+    # metrics init
+    lpips_loss_fn  = lpips.LPIPS(net='vgg').to(device).eval()
+    fid = FrechetInceptionDistance(feature=2048).to(device)
+
+    # load clip model
+    clip_model = CLIPVisionModelWithProjection.from_pretrained(args.clip_ckpt).to(device)
+    clip_model.eval()
 
     # create and load gpt model
     precision = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.precision]
@@ -80,8 +99,18 @@ def main(args):
             fullgraph=True
         ) # requires PyTorch 2.0 (optional)
     else:
-        print(f"no need to compile model in demo") 
-    
+        print(f"no need to compile model in demo")
+
+    # load dataset
+    dataset = RE10KVideoEvalDataset(args)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.per_proc_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+    )    
 
     # Create folder to save samples:
     model_string_name = args.gpt_model.replace("/", "-")
@@ -98,7 +127,7 @@ def main(args):
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = args.per_proc_batch_size
     global_batch_size = n * dist.get_world_size()
-    num_fid_samples = min(args.num_fid_samples, len(prompt_list))
+    num_fid_samples = len(dataset)
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(num_fid_samples / global_batch_size) * global_batch_size)
     if rank == 0:
@@ -109,74 +138,58 @@ def main(args):
     iterations = int(samples_needed_this_gpu // n)
     pbar = range(iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
-    total = 0
+
     for _ in pbar:
-        # Select text prompt
-        prompt_batch = []
-        for i in range(n):
-            index = i * dist.get_world_size() + rank + total
-            prompt_batch.append(prompt_list[index] if index < len(prompt_list) else "a cute dog")
-              
-        # Sample inputs:
-        caption_embs, emb_masks = t5_model.get_text_embeddings(prompt_batch)
-        
-        if not args.no_left_padding:
-            new_emb_masks = torch.flip(emb_masks, dims=[-1])
-            new_caption_embs = []
-            for idx, (caption_emb, emb_mask) in enumerate(zip(caption_embs, emb_masks)):
-                valid_num = int(emb_mask.sum().item())
-                # prompt_cur = prompt_batch[idx]
-                # print(f'  prompt {idx} token len: {valid_num} : {prompt_cur}')
-                new_caption_emb = torch.cat([caption_emb[valid_num:], caption_emb[:valid_num]])
-                new_caption_embs.append(new_caption_emb)
-            new_caption_embs = torch.stack(new_caption_embs)
 
-        else:
-            new_caption_embs, new_emb_masks = caption_embs, emb_masks
+        batch = next(iter(dataloader))
+        frame_tensors, plucker_coords, clip_input, scene_name = batch
+        num_samples = frame_tensors.shape[0]
+        cond_input = clip_model(clip_input).image_embeds
 
-        c_indices = new_caption_embs * new_emb_masks[:,:, None]
-        c_emb_masks = new_emb_masks
-
-        qzshape = [len(c_indices), args.codebook_embed_dim, latent_size, latent_size]
         index_sample = generate(
-            gpt_model, c_indices, latent_size ** 2, 
-            c_emb_masks,
+            gpt_model, cond_input, plucker_coords, latent_size ** 2, 
             cfg_scale=args.cfg_scale,
             temperature=args.temperature, top_k=args.top_k,
             top_p=args.top_p, sample_logits=True, 
-            )
+        )
         
         samples = tokenizer.decode(index_sample, decode_from_indices=True) # output value is between [-1, 1]
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-        
-        # Save samples to disk as individual .png files
-        for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/images/{index:06d}.png")
-        total += global_batch_size
+
+        # reconstruction
+        encoded_indices = tokenizer.encode(frame_tensors)[1]['indices']
+        recons = tokenizer.decode(encoded_indices, decode_from_indices=True)
+
+        for i in range(num_samples):
+            gt = torch.clamp(rearrange(frame_tensors[i, :, 1:], "c t h w -> t h w c") * 0.5 + 0.5, 0, 1)
+            recon = torch.clamp(rearrange(recons[i, :, 1:], "c t h w -> t h w c") * 0.5 + 0.5, 0, 1)
+            sample = torch.clamp(rearrange(samples[i, :, 1:], "c t h w -> t h w c") * 0.5 + 0.5, 0, 1)
+            combined = torch.cat([gt, recon, sample], dim=-1)
+            combined = (combined * 255.0).cpu().to(torch.uint8)
+            write_video(f"{sample_folder_dir}/{scene_name[i]}/result_video.mp4", combined, fps=args.fps)
+
+            if args.compute_metrics:
+                psnr_score = np.mean([peak_signal_noise_ratio(a, b) for a, b in zip(sample, gt)])
+                ssim_score = np.mean([structural_similarity(a, b) for a, b in zip(sample, gt)])
+                lpips_score = lpips_loss_fn(
+                    rearrange(sample, "t h w c -> t c h w") * 2 - 1,
+                    rearrange(gt, "t h w c -> t c h w") * 2 - 1,
+                )
+                fid.update((rearrange(gt, "t h w c -> t c h w") * 255).cpu().to(torch.uint8).to(device), real=True)
+                fid.update((rearrange(sample, "t h w c -> t c h w") * 255).cpu().to(torch.uint8).to(device), real=False)
+
+                fid_score = fid.compute()
+                metrics = {
+                    "psnr": psnr_score,
+                    "ssim": ssim_score,
+                    "lpips": lpips_score,
+                    "fid": fid_score,
+                }
+                with open(f"{sample_folder_dir}/metrics.json", "a") as f:
+                    json.dump(metrics, f, indent=4)
+
+
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
-    dist.barrier()
-    if rank == 0:
-        # Save infer result in a jsonl file
-        json_items = []
-        for idx, prompt in enumerate(prompt_list):
-            image_path = os.path.join(sample_folder_dir, "images", f"{idx:06d}.png")
-            json_items.append({"text": prompt, "image_path": image_path})
-        res_jsonl_path = os.path.join(sample_folder_dir, "result.jsonl")
-        print(f"Save jsonl to {res_jsonl_path}...")
-        with open(res_jsonl_path, "w") as f:
-            for item in json_items:
-                f.write(json.dumps(item) + "\n")
-
-        # Save captions to txt
-        caption_path = os.path.join(sample_folder_dir, "captions.txt")
-        print(f"Save captions to {caption_path}...")
-        with open(caption_path, "w") as f:
-            for item in prompt_list:
-                f.write(f"{item}\n")
-        print("Done.")
-    
     dist.barrier()
     dist.destroy_process_group()
 
@@ -219,5 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=1000, help="top-k value to sample with")
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
+    parser.add_argument("--fps", type=int, default=8, help="fps of the video")
+    parser.add_argument("--compute-metrics", action='store_true', default=False)
     args = parser.parse_args()
     main(args)

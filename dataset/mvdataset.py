@@ -13,6 +13,49 @@ from augmentation import center_crop_arr
 
 DL3DV_SCALE = 4
 
+def process_transform_json(filename: Path, dataset_name: str, image_size: int):
+    with open(filename, 'r') as f:
+        cam = json.load(f)
+
+    frames = sorted(cam["frames"], key=lambda x: x["file_path"])
+    if "fl_x" in cam and "cx" in cam:
+        fx, fy, cx, cy, h, w = \
+            cam["fl_x"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["fl_x"], \
+            cam["fl_y"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["fl_y"], \
+            cam["cx"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["cx"], \
+            cam["cy"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["cy"], \
+            cam["h"] // DL3DV_SCALE if dataset_name == "dl3dv" else cam["h"], \
+            cam["w"] // DL3DV_SCALE if dataset_name == "dl3dv" else cam["w"]
+    else:
+        fx, fy, cx, cy, h, w = \
+            frames[0]["fl_x"], \
+            frames[0]["fl_y"], \
+            frames[0]["cx"], \
+            frames[0]["cy"], \
+            frames[0]["h"], \
+            frames[0]["w"]
+        
+    extrinsics, intrinsics = [], []
+
+    resize_scale = min(h / image_size, w / image_size)
+    for frame in frames:
+        c2w = torch.tensor(frame["transform_matrix"]).float()
+        if dataset_name == "dl3dv" or dataset_name == "co3d" or dataset_name == "MVImgNet":
+            c2w[2, :] *= -1
+            c2w = c2w[torch.tensor([1, 0, 2, 3]), :]
+            c2w[0:3, 1:3] *= -1
+        intrinsic = torch.eye(3).float()
+        intrinsic[0, 0] = fx / resize_scale / image_size
+        intrinsic[0, 2] = cx / w
+        intrinsic[1, 1] = fy / resize_scale / image_size
+        intrinsic[1, 2] = cy / h
+        
+        extrinsics.append(c2w)
+        intrinsics.append(intrinsic)
+
+    extrinsics = torch.stack(extrinsics)
+    intrinsics = torch.stack(intrinsics)
+    return extrinsics, intrinsics
 
 class MultiViewDataset(Dataset):
     def __init__(self, args):
@@ -36,7 +79,7 @@ class MultiViewDataset(Dataset):
 
         indices = torch.from_numpy(np.load(indices_file)).long()
 
-        extrinsics, intrinsics = self.process_transform_json(transform_file, dataset_name)
+        extrinsics, intrinsics = process_transform_json(transform_file, dataset_name)
         # get plucker coordinates (ray embeddings)
         extrinsics_src = extrinsics[0]
         c2w_src = torch.linalg.inv(extrinsics_src)
@@ -55,50 +98,6 @@ class MultiViewDataset(Dataset):
 
         return indices[1:], plucker_coords, clip_input
 
-    def process_transform_json(self, filename: Path, dataset_name: str):
-        with open(filename, 'r') as f:
-            cam = json.load(f)
-
-        frames = sorted(cam["frames"], key=lambda x: x["file_path"])
-        if "fl_x" in cam and "cx" in cam:
-            fx, fy, cx, cy, h, w = \
-                cam["fl_x"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["fl_x"], \
-                cam["fl_y"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["fl_y"], \
-                cam["cx"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["cx"], \
-                cam["cy"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["cy"], \
-                cam["h"] // DL3DV_SCALE if dataset_name == "dl3dv" else cam["h"], \
-                cam["w"] // DL3DV_SCALE if dataset_name == "dl3dv" else cam["w"]
-        else:
-            fx, fy, cx, cy, h, w = \
-                frames[0]["fl_x"], \
-                frames[0]["fl_y"], \
-                frames[0]["cx"], \
-                frames[0]["cy"], \
-                frames[0]["h"], \
-                frames[0]["w"]
-            
-        extrinsics, intrinsics = [], []
-
-        resize_scale = min(h / self.image_size, w / self.image_size)
-        for frame in frames:
-            c2w = torch.tensor(frame["transform_matrix"]).float()
-            if dataset_name == "dl3dv" or dataset_name == "co3d" or dataset_name == "MVImgNet":
-                c2w[2, :] *= -1
-                c2w = c2w[torch.tensor([1, 0, 2, 3]), :]
-                c2w[0:3, 1:3] *= -1
-            intrinsic = torch.eye(3).float()
-            intrinsic[0, 0] = fx / resize_scale / self.image_size
-            intrinsic[0, 2] = cx / w
-            intrinsic[1, 1] = fy / resize_scale / self.image_size
-            intrinsic[1, 2] = cy / h
-            
-            extrinsics.append(c2w)
-            intrinsics.append(intrinsic)
-
-        extrinsics = torch.stack(extrinsics)
-        intrinsics = torch.stack(intrinsics)
-        return extrinsics, intrinsics 
-        
 
 class RE10KVideoEvalDataset(Dataset):
     def __init__(self, args):
@@ -114,9 +113,10 @@ class RE10KVideoEvalDataset(Dataset):
         
         self.scenes = self.data_list.keys()
         self.num_frames = args.num_frames
+        self.image_size = args.image_size
 
         self.transform = transforms.Compose([
-            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, self.image_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
@@ -130,10 +130,29 @@ class RE10KVideoEvalDataset(Dataset):
 
         scene_folder = self.index_meta[scene_name].split(".")[0]
         
-        target_indices = scene_meta["target"]
+        target_indices = scene_meta["target"][:self.num_frames]
         context_indices = scene_meta["context"]
 
         image_dir = Path(self.data_dir) / scene_folder / scene_name / "images"
 
-        first_frame = Image.open(image_dir / f"frame_{context_indices[0]:06d}.png")
+        first_frame = Image.open(image_dir / f"frame_{context_indices[0]:06d}.png").convert("RGB")
+        target_frames = [Image.open(image_dir / f"frame_{target_index}").convert("RGB") for target_index in target_indices]
+
+        all_frames = [first_frame] + target_frames
+        all_frames = [self.transform(f) for f in all_frames]
+        frame_tensors = torch.stack(all_frames)
+
+        transform_file = Path(self.data_dir) / scene_folder / scene_name / "transforms.json"
+        extrinsics, intrinsics = process_transform_json(transform_file, "re10k", self.image_size)
+        
+        plucker_coords = get_plucker_coordinates(
+                extrinsics[0],
+                extrinsics,
+                intrinsics,
+                [self.image_size, self.image_size]
+        )
+        clip_input = self.feature_extractor(images=first_frame, return_tensors="pt").pixel_values[0]
+
+        return frame_tensors, plucker_coords, clip_input, scene_name
+
     
