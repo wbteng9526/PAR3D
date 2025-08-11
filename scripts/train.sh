@@ -11,7 +11,7 @@ torchrun \
 --nnodes=1 --nproc_per_node=8 --node_rank=0 \
 --master_addr=$master_addr --master_port=$master_port \
 autoregressive/train/train_3d.py \
---cloud-save-path /wekafs/ict/wenbinte/projects/PAR3D \
+--cloud-save-path /wekafs/ict/wenbinte/projects/PAR3D/GPT-L \
 --data-path /wekafs/ict/wenbinte/data/MVDataset_vidtok_code_video \
 --global-index-file /wekafs/ict/wenbinte/data/MVDataset_vidtok_code_video/global_index.txt \
 --results-dir /wekafs/ict/wenbinte/projects/PAR3D/logs \
@@ -21,6 +21,6 @@ autoregressive/train/train_3d.py \
 --image-size 256 \
 --temporal-size 4 \
 --downsample-size 8 \
---gpt-model GPT-XL \
+--gpt-model GPT-L \
 --global-batch-size 8 \
 --wandb-project PAR3D_training

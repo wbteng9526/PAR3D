@@ -52,7 +52,6 @@ class ModelArgs:
     spe_token_num: int = 3
 
     # token permutation
-    num_views: int = 4
     temporal_size: int = 4
     downsample_size: int = 8
     image_size: int = 256
@@ -274,7 +273,7 @@ class Transformer(nn.Module):
         self.cls_token_num = config.cls_token_num
         self.spe_token_num = config.spe_token_num
         self.ar_token_num = config.ar_token_num
-        self.num_views = config.num_views
+        self.num_views = config.temporal_size
 
        
         self.cls_embedding = ImageEmbedder(config.image_dim, config.dim, config.class_dropout_prob)
@@ -318,7 +317,7 @@ class Transformer(nn.Module):
         assert grid_size * grid_size == self.block_size // self.num_views
         # Create freqs_cis for interleaved camera and idx tokens
         self.freqs_cis = precompute_freqs_cis_3d(
-            self.config.num_views, 
+            self.num_views, 
             grid_size, 
             self.config.dim // self.config.n_head, 
             self.config.rope_base, 
@@ -377,29 +376,29 @@ class Transformer(nn.Module):
 
         group_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
         group_mask[:, 0] = True
-        group_size = self.spe_token_num + 1
+        group_size = (self.spe_token_num + 1) * 2
         # Adjust for interleaved tokens in cache setup
-        for i in range(0, (self.max_seq_length - self.cls_token_num - self.spe_token_num) // (2 * group_size)):
-            start = self.cls_token_num + 2 * self.ar_token_num + i * (2 * group_size)
-            end = start + 2 * group_size
+        for i in range(0, (self.max_seq_length) // (group_size)):
+            start = 2 * self.ar_token_num + i * (group_size)
+            end = start + group_size
             if end <= self.max_seq_length:
                 group_mask[start:end, :end] = True
         self.causal_mask = group_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
         
         # causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
         # self.causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-        grid_size = int((self.config.block_size // self.config.num_views) ** 0.5)
+        grid_size = int((self.config.block_size // self.config.temporal_size) ** 0.5)
         assert grid_size * grid_size == self.block_size // self.num_views
         # Create freqs_cis for doubled sequence length (interleaved camera and idx tokens)
-        self.freqs_cis = precompute_freqs_cis_3d(self.config.num_views, grid_size, self.config.dim // self.config.n_head, self.config.rope_base, 
+        self.freqs_cis = precompute_freqs_cis_3d(self.config.temporal_size, grid_size, self.config.dim // self.config.n_head, self.config.rope_base, 
                                                   self.cls_token_num, spe_token_num=self.spe_token_num, 
                                                 ar_token_num=self.ar_token_num)
 
     def forward(
         self, 
-        idx: torch.Tensor, 
-        cam: torch.Tensor,
-        cond_idx: torch.Tensor,  # cond_idx_or_embed
+        idx: Optional[torch.Tensor] = None, 
+        cam: Optional[torch.Tensor] = None,
+        cond_idx: Optional[torch.Tensor] = None,  # cond_idx_or_embed
         input_pos:  Optional[torch.Tensor] = None, 
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
@@ -446,26 +445,30 @@ class Transformer(nn.Module):
             )
 
         else:
-            # if cond_idx is not None: # prefill in inference
-            #     self.start = False
-            #     token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
-            #     # spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
-            #     # token_embeddings = torch.cat((token_embeddings, spe_embeddings), dim=1)
-            # else: # decode_n_tokens(kv cache) in inferenceå
-            #     if idx.shape[1]>1 and not self.start:
-            #         token_embeddings = self.tok_embeddings(idx)
-            #         spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
-            #         token_embeddings = torch.cat((token_embeddings[:,-1:], spe_embeddings), dim=1)
-            #         # token_embeddings = spe_embeddings.to(token_embeddings.device)
-            #         self.start = True
-            #     else:
-            #         token_embeddings = self.tok_embeddings(idx)
+            cam_tokens = cam
+            if cond_idx is not None: # prefill in inference
+                self.start = False
+                token_embeddings = self.cls_embedding(cond_idx, train=self.training).unsqueeze(1)
+                token_embeddings = torch.cat((token_embeddings, cam_tokens), dim=1)
+                # spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
+                # token_embeddings = torch.cat((token_embeddings, spe_embeddings), dim=1)
+            else: # decode_n_tokens(kv cache) in inferenceå
+                if idx.shape[1]>1 and not self.start:
+                    token_embeddings = self.tok_embeddings(idx)
+                    interleaved_spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
+                    token_embeddings = torch.cat((token_embeddings[:,-1:], interleaved_spe_embeddings), dim=1)
+                    # token_embeddings = spe_embeddings.to(token_embeddings.device)
+                    self.start = True
+                else:
+                    token_embeddings = self.tok_embeddings(idx)
+                    token_embeddings = interleave_tokens(cam_tokens, token_embeddings) # b x (2*seq_len) x dim
+
+
             
-            # bs = token_embeddings.shape[0]
-            # mask = self.causal_mask[:bs, None, input_pos]
-            # h = self.tok_dropout(token_embeddings)
-            # self.freqs_cis = self.freqs_cis
-            raise ValueError("Not implemented")
+            bs = token_embeddings.shape[0]
+            mask = self.causal_mask[:bs, None, input_pos]
+            h = self.tok_dropout(token_embeddings)
+            self.freqs_cis = self.freqs_cis
         
         if self.training:
             freqs_cis = freqs_cis[:token_embeddings.shape[1]]
@@ -497,6 +500,56 @@ class Transformer(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
+    
+    def forward_reference(
+        self,
+        prev_idx: Optional[torch.Tensor] = None,
+        prev_cam_token: Optional[torch.Tensor] = None,
+        cur_cam_token: Optional[torch.Tensor] = None,
+        cond_idx: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+    ):
+        if cond_idx is not None:
+            # cond -> first token
+            # input_pos should be [0, 1] assuming cond_idx has only one token
+            token_embeddings = self.cls_embedding(cond_idx, train=self.training).unsqueeze(1)
+            assert prev_cam_token is None, "Predicting the first token given condition token, no camera token should be given"
+            token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
+        elif prev_idx.shape[1] == 1:
+            # autoregression stage, predict all the ar tokens
+            token_embeddings = self.tok_embeddings(prev_idx)
+            # need to interleave with previous camera tokens
+            token_embeddings = interleave_tokens(prev_cam_token, token_embeddings)
+            token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
+        elif prev_idx.shape[1] > 1:
+            # parallel autoregression stage, predict multiple tokens at once
+            token_embeddings = self.tok_embeddings(prev_idx)
+            # need to interleave with previous camera tokens
+            token_embeddings = interleave_tokens(prev_cam_token, token_embeddings)
+            interleaved_spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
+            token_embeddings = torch.cat([token_embeddings[:,-2:], interleaved_spe_embeddings], dim=1)
+            token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
+
+        bs = token_embeddings.shape[0]
+        mask = self.causal_mask[:bs, None, input_pos]
+        h = self.tok_dropout(token_embeddings)
+
+        token_freqs_cis = self.freqs_cis[self.cls_token_num:].clone().to(h.device)
+        freqs_cis = torch.cat(
+            (self.freqs_cis[:self.cls_token_num].to(h.device),
+                interleave_tokens_1d(token_freqs_cis, token_freqs_cis))
+        )
+
+        freqs_cis = freqs_cis[input_pos]
+        # transformer blocks
+        for layer in self.layers:
+            h = layer(h, freqs_cis, input_pos, mask)
+        
+        # output layers
+        h = self.norm(h)
+        logits = self.output(h).float()
+
+        return logits
 
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:

@@ -9,7 +9,7 @@ import numpy as np
 from transformers import CLIPImageProcessor
 from PIL import Image
 from utils.geometry import get_plucker_coordinates
-from augmentation import center_crop_arr
+from dataset.augmentation import center_crop_arr
 
 DL3DV_SCALE = 4
 
@@ -79,7 +79,7 @@ class MultiViewDataset(Dataset):
 
         indices = torch.from_numpy(np.load(indices_file)).long()
 
-        extrinsics, intrinsics = process_transform_json(transform_file, dataset_name)
+        extrinsics, intrinsics = process_transform_json(transform_file, dataset_name, self.image_size)
         # get plucker coordinates (ray embeddings)
         extrinsics_src = extrinsics[0]
         c2w_src = torch.linalg.inv(extrinsics_src)
