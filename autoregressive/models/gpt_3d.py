@@ -136,6 +136,25 @@ class MLP(nn.Module):
         x = self.fc2(x)
         return x
 
+class RVQHeads(nn.Module):
+    def __init__(self, d_model: int, K_list: list[int]):
+        super().__init__()
+        self.M = len(K_list)
+        self.heads = nn.ModuleList([nn.Linear(d_model, Km, bias=True) for Km in K_list])
+    def forward(self, h: torch.Tensor, y_parts: torch.Tensor, reduction: str = "mean"):
+        losses, logits_list = [], []
+        for m, head in enumerate(self.heads):
+            z = head(h)                        # [N, K_m]
+            logits_list.append(z)
+            losses.append(F.cross_entropy(z, y_parts[:, m], reduction=reduction))
+        if reduction == "mean":
+            loss = sum(losses) / len(losses)
+        elif reduction == "sum":
+            loss = sum(losses)
+        else:
+            loss = torch.stack(losses, dim=-1) # [N, M]
+        return loss, logits_list
+
 
 #################################################################################
 #                                  GPT Model                                    #
@@ -346,6 +365,10 @@ class Transformer(nn.Module):
 
         self.initialize_weights()
 
+        # Optional for RVQ
+        # self.rvq_heads = RVQHeads(config.dim, [32, 32, 32]) # vocab_size = 32768 = 32 * 32 * 32
+
+
     def initialize_weights(self):        
         # Initialize nn.Linear and nn.Embedding
         self.apply(self._init_weights)
@@ -463,6 +486,7 @@ class Transformer(nn.Module):
             start_idx = self.cls_token_num
             # Select only the idx token positions from interleaved sequence
             logits = logits[:, start_idx:(start_idx + self.block_size * 2):2].contiguous()
+            hidden_states = h[:, start_idx:(start_idx + self.block_size * 2):2].contiguous()
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -472,6 +496,9 @@ class Transformer(nn.Module):
             loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
         elif targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # apply rvq
+            # y_parts = split_to_parts(targets, [32, 32, 32])
+            # loss, _ = self.rvq_heads(hidden_states, y_parts, reduction="mean")
 
         return logits, loss
     
@@ -679,6 +706,14 @@ def interleave_tokens_1d(seq1, seq2):
     result[::2] = seq1
     result[1::2] = seq2
     return result
+
+def split_to_parts(y: torch.Tensor, K_list: list[int]) -> torch.Tensor:
+    parts = []
+    cur = y.clone()
+    for K in K_list:
+        parts.append(cur % K)
+        cur = torch.div(cur, K, rounding_mode='floor')
+    return torch.stack(parts, dim=-1)
 
 
 #################################################################################
