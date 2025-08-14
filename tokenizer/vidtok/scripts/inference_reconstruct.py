@@ -21,8 +21,8 @@ from torch import autocast
 from torchvision import transforms
 from torchvision.io import write_video
 
-from vidtok.modules.util import print0
-from scripts.inference_evaluate import load_model_from_config
+from tokenizer.vidtok.modules.util import print0
+from tokenizer.vidtok.scripts.inference_evaluate import load_model_from_config
 
 
 class SingleVideoDataset(torch.utils.data.Dataset):

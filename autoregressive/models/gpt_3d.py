@@ -411,20 +411,17 @@ class Transformer(nn.Module):
             cam_encoded = cam_encoded.permute(0, 2, 3, 4, 1).contiguous()  # b x v x h x w x dim
             
             # Apply same permutation as idx to camera tokens
-            cam_tokens = permute_token(cam_encoded, self.config)[:,:-1]    
+            cam_tokens = permute_token(cam_encoded, self.config)    
             
             idx = permute_token(idx, self.config)
             if self.training and targets is None:
                 targets = idx
             cond_embeddings = self.cls_embedding(cond_idx, train=self.training).unsqueeze(1)
-            token_embeddings = self.tok_embeddings(idx[:,:-1])
+            token_embeddings = self.tok_embeddings(idx)
             interleaved_spe_tokens = self.spe_tok_embeddings().unsqueeze(0).expand(cond_embeddings.shape[0], -1, -1)
 
             # interleave camera tokens with idx tokens
             interleaved_tokens = interleave_tokens(cam_tokens, token_embeddings) # b x (2*seq_len) x dim
-
-            # interleave special tokens
-            # interleaved_spe_tokens = interleave_tokens(spe_embeddings, spe_embeddings)
             
             # Split interleaved tokens for special token insertion
             token_embeddings_first, token_embeddings_last = interleaved_tokens[:,:2*self.ar_token_num], interleaved_tokens[:,2*self.ar_token_num:]
@@ -445,30 +442,7 @@ class Transformer(nn.Module):
             )
 
         else:
-            cam_tokens = cam
-            if cond_idx is not None: # prefill in inference
-                self.start = False
-                token_embeddings = self.cls_embedding(cond_idx, train=self.training).unsqueeze(1)
-                token_embeddings = torch.cat((token_embeddings, cam_tokens), dim=1)
-                # spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
-                # token_embeddings = torch.cat((token_embeddings, spe_embeddings), dim=1)
-            else: # decode_n_tokens(kv cache) in inferenceå
-                if idx.shape[1]>1 and not self.start:
-                    token_embeddings = self.tok_embeddings(idx)
-                    interleaved_spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
-                    token_embeddings = torch.cat((token_embeddings[:,-1:], interleaved_spe_embeddings), dim=1)
-                    # token_embeddings = spe_embeddings.to(token_embeddings.device)
-                    self.start = True
-                else:
-                    token_embeddings = self.tok_embeddings(idx)
-                    token_embeddings = interleave_tokens(cam_tokens, token_embeddings) # b x (2*seq_len) x dim
-
-
-            
-            bs = token_embeddings.shape[0]
-            mask = self.causal_mask[:bs, None, input_pos]
-            h = self.tok_dropout(token_embeddings)
-            self.freqs_cis = self.freqs_cis
+            raise NotImplementedError("Only training or naive inference is supported")
         
         if self.training:
             freqs_cis = freqs_cis[:token_embeddings.shape[1]]
@@ -486,7 +460,7 @@ class Transformer(nn.Module):
         if self.training:
             # Extract logits only for idx token positions (skip camera tokens)
             # Pattern: [cond_tokens] [c0, idx0, c1, idx1, ...] -> extract idx0, idx1, ...
-            start_idx = self.cls_token_num - 1
+            start_idx = self.cls_token_num
             # Select only the idx token positions from interleaved sequence
             logits = logits[:, start_idx:(start_idx + self.block_size * 2):2].contiguous()
 
@@ -510,24 +484,27 @@ class Transformer(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
     ):
         if cond_idx is not None:
+            self.start = False
             # cond -> first token
             # input_pos should be [0, 1] assuming cond_idx has only one token
             token_embeddings = self.cls_embedding(cond_idx, train=self.training).unsqueeze(1)
             assert prev_cam_token is None, "Predicting the first token given condition token, no camera token should be given"
             token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
-        elif prev_idx.shape[1] == 1:
-            # autoregression stage, predict all the ar tokens
-            token_embeddings = self.tok_embeddings(prev_idx)
-            # need to interleave with previous camera tokens
-            token_embeddings = interleave_tokens(prev_cam_token, token_embeddings)
-            token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
-        elif prev_idx.shape[1] > 1:
+        
+        elif prev_idx.shape[1] > 1 and not self.start:
             # parallel autoregression stage, predict multiple tokens at once
             token_embeddings = self.tok_embeddings(prev_idx)
             # need to interleave with previous camera tokens
             token_embeddings = interleave_tokens(prev_cam_token, token_embeddings)
             interleaved_spe_embeddings = self.spe_tok_embeddings().unsqueeze(0).expand(token_embeddings.shape[0], -1, -1)
             token_embeddings = torch.cat([token_embeddings[:,-2:], interleaved_spe_embeddings], dim=1)
+            token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
+            self.start = True
+        else:
+            # autoregression stage, predict all the ar tokens
+            token_embeddings = self.tok_embeddings(prev_idx)
+            # need to interleave with previous camera tokens
+            token_embeddings = interleave_tokens(prev_cam_token, token_embeddings)
             token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
 
         bs = token_embeddings.shape[0]
@@ -658,7 +635,7 @@ def permute_token(x, args):
         raise ValueError(f"Input tensor must have at least 4 dimensions, got {len(x.shape)}")
     
     latent_size = args.image_size // args.downsample_size
-    sub_num = int((args.ar_token_num//args.num_views)**0.5)
+    sub_num = int((args.ar_token_num//args.temporal_size)**0.5)
     
     # Extract core dimensions and extra dimensions
     batch_size = x.shape[0]
@@ -676,12 +653,13 @@ def permute_token(x, args):
     # Create dynamic permutation indices
     # Core permutation: [b, t, s, h//s, s, w//s] -> [b, h//s, w//s, t, s, s]
     core_perm = [0, 3, 5, 1, 2, 4]
+
     # Add indices for extra dimensions (they stay in place after the core permutation)
     extra_perm = list(range(6, 6 + len(extra_dims)))
     perm_indices = core_perm + extra_perm
     
     # Apply permutation
-    z = z.permute(*perm_indices)
+    z = z.permute(*perm_indices) # [b, h//s, w//s, t, s, s]
     
     # Reshape to [b, -1, ...]
     z = z.reshape(batch_size, -1, *extra_dims)
@@ -714,7 +692,7 @@ def GPT_3B(**kwargs):
     return Transformer(ModelArgs(n_layer=24, n_head=32, dim=3200, **kwargs)) # 3.1B
 
 def GPT_1B(**kwargs):
-    return Transformer(ModelArgs(n_layer=22, n_head=32, dim=2048, **kwargs)) # 1.2B
+    return Transformer(ModelArgs(n_layer=22, n_head=40, dim=2560, **kwargs)) # 1.2B
 
 ### class-conditional
 def GPT_XXXL(**kwargs):

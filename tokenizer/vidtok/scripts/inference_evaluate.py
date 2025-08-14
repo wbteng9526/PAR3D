@@ -17,9 +17,9 @@ import torch
 from einops import rearrange
 from lightning.pytorch import seed_everything
 
-from vidtok.data.vidtok import VidTokValDataset
-from vidtok.modules.lpips import LPIPS
-from vidtok.modules.util import (compute_psnr, compute_ssim,
+from tokenizer.vidtok.data.vidtok import VidTokValDataset
+from tokenizer.vidtok.modules.lpips import LPIPS
+from tokenizer.vidtok.modules.util import (compute_psnr, compute_ssim,
                                  instantiate_from_config, print0)
 
 

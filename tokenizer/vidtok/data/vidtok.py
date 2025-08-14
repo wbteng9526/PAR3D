@@ -11,8 +11,8 @@ from torch.utils.data import Dataset
 from torchvision.transforms import v2
 from tqdm import trange
 
-from vidtok.modules.util import print0
-from .video_read import read_frames_with_decord
+from tokenizer.vidtok.modules.util import print0
+from tokenizer.vidtok.data.video_read import read_frames_with_decord
 
 
 class VidTokDataset(Dataset):

@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torchvision import models
 
-from .util import print0
+from tokenizer.vidtok.modules.util import print0
 
 URL_MAP = {"vgg_lpips": "https://heibox.uni-heidelberg.de/f/607503859c864bc1b30b/?dl=1"}
 

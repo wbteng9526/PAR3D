@@ -9,10 +9,10 @@ import torch
 import lightning.pytorch as pl
 
 from safetensors.torch import load_file as load_safetensors
-from vidtok.modules.ema import LitEma
-from vidtok.modules.util import (default, get_obj_from_str,
+from tokenizer.vidtok.modules.ema import LitEma
+from tokenizer.vidtok.modules.util import (default, get_obj_from_str,
                                  instantiate_from_config, print0)
-from vidtok.modules.regularizers import pack_one, unpack_one, rearrange
+from tokenizer.vidtok.modules.regularizers import pack_one, unpack_one, rearrange
 
 
 class AbstractAutoencoder(pl.LightningModule):

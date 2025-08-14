@@ -4,7 +4,7 @@ import decord
 import numpy as np
 import torch
 
-from vidtok.modules.util import print0
+from tokenizer.vidtok.modules.util import print0
 
 decord.bridge.set_bridge("torch")
 

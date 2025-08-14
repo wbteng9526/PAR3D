@@ -1,6 +1,6 @@
 model:
   base_learning_rate: 1e-5
-  target: vidtok.models.autoencoder.AutoencodingEngine
+  target: tokenizer.vidtok.models.autoencoder.AutoencodingEngine
   params:
     monitor: val/rec_loss
     mode: min
@@ -9,7 +9,7 @@ model:
     # ema_decay: 0.999
 
     encoder_config:
-      target: vidtok.modules.model_3dcausal.EncoderCausal3DPadding
+      target: tokenizer.vidtok.modules.model_3dcausal.EncoderCausal3DPadding
       params:
         double_z: false
         z_channels: 5
@@ -27,11 +27,11 @@ model:
         fix_decoder: false  # if True, fix it without updating params
 
     decoder_config:
-      target: vidtok.modules.model_3dcausal.DecoderCausal3DPadding
+      target: tokenizer.vidtok.modules.model_3dcausal.DecoderCausal3DPadding
       params: ${model.params.encoder_config.params}
 
     regularizer_config:
-      target: vidtok.modules.regularizers.FSQRegularizer
+      target: tokenizer.vidtok.modules.regularizers.FSQRegularizer
       params:
         levels: [8, 8, 8, 8, 8]  # codebook size: 8*8*8*8*8=32768
         entropy_loss_weight: 0.1
@@ -40,7 +40,7 @@ model:
         commitment_loss_weight: 0.25
 
     loss_config:
-      target: vidtok.modules.losses.GeneralLPIPSWithDiscriminator
+      target: tokenizer.vidtok.modules.losses.GeneralLPIPSWithDiscriminator
       params:
         dims: 3  # video - [t,h,w]
         perceptual_weight: 1.0  
@@ -53,13 +53,13 @@ model:
         regularization_weights: {'aux_loss': 1.0, 'kl_loss': 0.000001}
 
 data:
-  target: vidtok.data.datamodule.DataModuleFromConfig
+  target: tokenizer.vidtok.data.datamodule.DataModuleFromConfig
   params:
     batch_size: 2
     num_workers: 12
 
     train:
-      target: vidtok.data.vidtok.VidTokDataset
+      target: tokenizer.vidtok.data.vidtok.VidTokDataset
       params:
         data_dir: DATA_DIR_1  # DATA_DIR for training data
         meta_path: META_PATH_1  # path to the .csv meta file of training data
@@ -70,7 +70,7 @@ data:
           sample_fps: 3
 
     validation:
-      target: vidtok.data.vidtok.VidTokDataset
+      target: tokenizer.vidtok.data.vidtok.VidTokDataset
       params:
         data_dir: DATA_DIR_2  # DATA_DIR for validation data
         meta_path: META_PATH_2  # path to the .csv meta file of validation data
@@ -93,7 +93,7 @@ lightning:
 
   callbacks:
     image_logger:
-      target: vidtok.modules.logger.ImageVideoLogger
+      target: tokenizer.vidtok.modules.logger.ImageVideoLogger
       params:
         disabled: false
         rescale: true

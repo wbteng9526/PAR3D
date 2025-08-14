@@ -5,7 +5,7 @@ import torch
 import lightning.pytorch as pl
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from vidtok.modules.util import instantiate_from_config
+from tokenizer.vidtok.modules.util import instantiate_from_config
 
 
 class WrappedDataset(Dataset):

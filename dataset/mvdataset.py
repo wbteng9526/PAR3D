@@ -10,14 +10,17 @@ from transformers import CLIPImageProcessor
 from PIL import Image
 from utils.geometry import get_plucker_coordinates
 from dataset.augmentation import center_crop_arr
+import random
 
 DL3DV_SCALE = 4
 
-def process_transform_json(filename: Path, dataset_name: str, image_size: int):
+def process_transform_json(filename: Path, dataset_name: str, image_size: int, selected_indices: list = None):
     with open(filename, 'r') as f:
         cam = json.load(f)
 
     frames = sorted(cam["frames"], key=lambda x: x["file_path"])
+    if selected_indices is not None:
+        frames = [f for f in frames if int(f["file_path"].split("_")[-1].split(".")[0]) in selected_indices]
     if "fl_x" in cam and "cx" in cam:
         fx, fy, cx, cy, h, w = \
             cam["fl_x"] / DL3DV_SCALE if dataset_name == "dl3dv" else cam["fl_x"], \
@@ -111,7 +114,7 @@ class RE10KVideoEvalDataset(Dataset):
         with open(self.index_file, 'r') as f:
             self.index_meta = json.load(f)
         
-        self.scenes = self.data_list.keys()
+        self.scenes = list(self.data_list.keys())
         self.num_frames = args.num_frames
         self.image_size = args.image_size
 
@@ -120,11 +123,20 @@ class RE10KVideoEvalDataset(Dataset):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
+        self.feature_extractor = CLIPImageProcessor.from_pretrained(args.clip_ckpt)
     
     def __len__(self):
         return len(self.scenes)
     
     def __getitem__(self, idx):
+        while True:
+            try:
+                return self.__getitem(idx)
+            except Exception as e:
+                # print(e)
+                idx = random.randint(0, len(self.scenes) - 1)
+    
+    def __getitem(self, idx):
         scene_name = self.scenes[idx]
         scene_meta = self.data_list[scene_name]
 
@@ -136,14 +148,14 @@ class RE10KVideoEvalDataset(Dataset):
         image_dir = Path(self.data_dir) / scene_folder / scene_name / "images"
 
         first_frame = Image.open(image_dir / f"frame_{context_indices[0]:06d}.png").convert("RGB")
-        target_frames = [Image.open(image_dir / f"frame_{target_index}").convert("RGB") for target_index in target_indices]
+        target_frames = [Image.open(image_dir / f"frame_{target_index:06d}.png").convert("RGB") for target_index in target_indices]
 
         all_frames = [first_frame] + target_frames
         all_frames = [self.transform(f) for f in all_frames]
         frame_tensors = torch.stack(all_frames)
 
         transform_file = Path(self.data_dir) / scene_folder / scene_name / "transforms.json"
-        extrinsics, intrinsics = process_transform_json(transform_file, "re10k", self.image_size)
+        extrinsics, intrinsics = process_transform_json(transform_file, "re10k", self.image_size, target_indices)
         
         plucker_coords = get_plucker_coordinates(
                 extrinsics[0],

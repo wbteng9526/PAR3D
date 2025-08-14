@@ -11,6 +11,7 @@ from transformers import CLIPVisionModelWithProjection
 from torchvision.io import write_video
 
 import os
+import sys
 import numpy as np
 import math
 import json
@@ -25,6 +26,7 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 import lpips                              # pip install lpips
 from torchmetrics.image.fid import FrechetInceptionDistance
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from tokenizer.vidtok.scripts.inference_evaluate import load_model_from_config
 from autoregressive.models.gpt_3d import GPT_models, permute_token
 from autoregressive.models.generate_3d import generate
@@ -66,6 +68,7 @@ def main(args):
     precision = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.precision]
     latent_size = args.image_size // args.downsample_size
     gpt_model = GPT_models[args.gpt_model](
+        vocab_size=args.vocab_size,
         block_size=latent_size ** 2 * args.temporal_size,
         cls_token_num=args.cls_token_num,
         resid_dropout_p=args.dropout_p if args.drop_path_rate > 0.0 else 0.0,
@@ -76,7 +79,7 @@ def main(args):
         ar_token_num=args.ar_token_num,
     ).to(device=device, dtype=precision)
 
-    checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+    checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
  
     if "model" in checkpoint:  # ddp
         model_weight = checkpoint["model"]
@@ -107,21 +110,17 @@ def main(args):
         dataset,
         batch_size=args.per_proc_batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=0,
         drop_last=False,
     )    
 
     # Create folder to save samples:
     model_string_name = args.gpt_model.replace("/", "-")
     ckpt_string_name = os.path.basename(args.gpt_ckpt).replace(".pth", "").replace(".pt", "")
-    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-size-{args.image_size}-{args.vq_model}-" \
+    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-size-{args.image_size}-" \
                   f"topk-{args.top_k}-topp-{args.top_p}-temperature-{args.temperature}-" \
                   f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
-    if rank == 0:
-        os.makedirs(f"{sample_folder_dir}/images", exist_ok=True)
-        print(f"Saving .png samples at {sample_folder_dir}/images")
     dist.barrier()
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
@@ -139,40 +138,51 @@ def main(args):
     pbar = range(iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
 
-    for _ in pbar:
-
-        batch = next(iter(dataloader))
+    for batch in tqdm(dataloader, total=len(dataloader)):
+    # for _ in pbar:
+        # batch = next(iter(dataloader))
         frame_tensors, plucker_coords, clip_input, scene_name = batch
         num_samples = frame_tensors.shape[0]
+
+        frame_tensors, plucker_coords, clip_input = frame_tensors.to(device, dtype=precision), plucker_coords.to(device, dtype=precision), clip_input.to(device, dtype=precision)
         cond_input = clip_model(clip_input).image_embeds
+        frame_tensors = rearrange(frame_tensors, "b t c h w -> b c t h w")
         
-        with torch.no_grad():
+        
+        with torch.no_grad(), torch.cuda.amp.autocast(dtype=precision):
             cam_encoded = gpt_model.camera_encoder(plucker_coords)
             cam_encoded = cam_encoded.permute(0, 2, 3, 4, 1).contiguous()
             cam_encoded = permute_token(cam_encoded, args)
 
-        index_sample = generate(
-            gpt_model, 
-            cond_input, 
-            cam_encoded, 
-            max_new_tokens=latent_size ** 2 * args.temporal_size,
-            cfg_scale=args.cfg_scale,
-            temperature=args.temperature, top_k=args.top_k,
-            top_p=args.top_p, sample_logits=True, 
-        )
+            index_sample = generate(
+                gpt_model, 
+                cond_input, #[:, None, :], 
+                cam_encoded, 
+                max_new_tokens=latent_size ** 2 * args.temporal_size,
+                cfg_scale=args.cfg_scale,
+                temperature=args.temperature, top_k=args.top_k,
+                top_p=args.top_p, sample_logits=True, 
+                ar_token_num=args.ar_token_num,
+                spe_token_num=args.spe_token_num,
+            )
+            sub_num = int((args.ar_token_num // args.temporal_size) ** 0.5)
+            index_sample = index_sample.reshape(index_sample.shape[0], latent_size//sub_num, latent_size//sub_num, args.temporal_size, sub_num, sub_num)
+            index_sample = index_sample.permute(0, 3, 4, 1, 5, 2)
+            index_sample = index_sample.reshape(index_sample.shape[0], args.temporal_size, latent_size, latent_size)
+            
+            # reconstruction
+            encoded_indices = tokenizer.encode(frame_tensors, return_reg_log=True)[1]['indices']
+            first_frame_indices = encoded_indices[:, 0:1, :, :]
+            recons = tokenizer.decode(encoded_indices, decode_from_indices=True)
+            samples = tokenizer.decode(torch.cat([first_frame_indices, index_sample], dim=1), decode_from_indices=True) # output value is between [-1, 1]
         
-        samples = tokenizer.decode(index_sample, decode_from_indices=True) # output value is between [-1, 1]
-
-        # reconstruction
-        encoded_indices = tokenizer.encode(frame_tensors)[1]['indices']
-        recons = tokenizer.decode(encoded_indices, decode_from_indices=True)
-
         for i in range(num_samples):
             gt = torch.clamp(rearrange(frame_tensors[i, :, 1:], "c t h w -> t h w c") * 0.5 + 0.5, 0, 1)
             recon = torch.clamp(rearrange(recons[i, :, 1:], "c t h w -> t h w c") * 0.5 + 0.5, 0, 1)
             sample = torch.clamp(rearrange(samples[i, :, 1:], "c t h w -> t h w c") * 0.5 + 0.5, 0, 1)
-            combined = torch.cat([gt, recon, sample], dim=-1)
+            combined = torch.cat([gt, recon, sample], dim=-2)
             combined = (combined * 255.0).cpu().to(torch.uint8)
+            os.makedirs(f"{sample_folder_dir}/{scene_name[i]}", exist_ok=True)
             write_video(f"{sample_folder_dir}/{scene_name[i]}/result_video.mp4", combined, fps=args.fps)
 
             if args.compute_metrics:
@@ -192,7 +202,7 @@ def main(args):
                     "lpips": lpips_score,
                     "fid": fid_score,
                 }
-                with open(f"{sample_folder_dir}/metrics.json", "a") as f:
+                with open(f"{sample_folder_dir}/{scene_name[i]}/metrics.json", "a") as f:
                     json.dump(metrics, f, indent=4)
 
 
@@ -205,19 +215,19 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--evaluate-file", type=str, required=True)
+    parser.add_argument("--index-file", type=str, required=True)
     parser.add_argument("--tokenizer-config", type=str, default="configs/vidtok_fsq_causal_488_262144.yaml")
     parser.add_argument("--tokenizer-ckpt", type=str, default="/wekafs/ict/wenbinte/projects/RandAR3D/tokenizer/VidTok/vidtok_fsq_causal_488_262144.ckpt")
     parser.add_argument("--temporal-size", type=int, default=4)
-    parser.add_argument("--prompt-csv", type=str, default='evaluations/t2i/PartiPrompts.tsv')
-    parser.add_argument("--t5-path", type=str, default='pretrained_models/t5-ckpt')
-    parser.add_argument("--t5-model-type", type=str, default='flan-t5-xl')
-    parser.add_argument("--t5-feature-max-len", type=int, default=120)
-    parser.add_argument("--t5-feature-dim", type=int, default=2048)
-    parser.add_argument("--no-left-padding", action='store_true', default=False)
+    parser.add_argument("--num-frames", type=int, default=16)
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-XL")
     parser.add_argument("--gpt-ckpt", type=str, default=None)
+    parser.add_argument("--clip-ckpt", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--gpt-type", type=str, choices=['c2i', 't2i'], default="t2i", help="class->image or text->image")  
-    parser.add_argument("--cls-token-num", type=int, default=120, help="max token number of condition input")
+    parser.add_argument("--vocab-size", type=int, default=262144, help="vocabulary size of visual tokenizer")
+    parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
     parser.add_argument("--spe-token-num", type=int, default=15, help="number of special tokens")
     parser.add_argument("--ar-token-num", type=int, default=16, help="number of autoregressive tokens")
     parser.add_argument("--dropout-p", type=float, default=0.0, help="dropout probability")
@@ -230,7 +240,6 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=7.5)
     parser.add_argument("--sample-dir", type=str, default="samples_parti", help="samples_coco or samples_parti")
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
-    parser.add_argument("--num-fid-samples", type=int, default=30000)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=1000, help="top-k value to sample with")
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")

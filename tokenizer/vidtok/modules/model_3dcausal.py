@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .util import checkpoint
+from tokenizer.vidtok.modules.util import checkpoint
 
 
 def spatial_temporal_resblk(x, block_s, block_t, temb):

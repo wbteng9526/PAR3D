@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from .model_3dcausal import (AttnBlock, Normalize, nonlinearity,
+from tokenizer.vidtok.modules.model_3dcausal import (AttnBlock, Normalize, nonlinearity,
                              spatial_temporal_resblk)
-from .util import checkpoint
+from tokenizer.vidtok.modules.util import checkpoint
 
 
 def make_attn(in_channels, use_checkpoint=False, norm_type="groupnorm"):

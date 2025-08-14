@@ -92,7 +92,7 @@ def logits_to_probs(logits, temperature: float = 1.0, top_p: float=1.0, top_k: i
 
 
 def prefill(model, cond_idx: torch.Tensor, camera_params: torch.Tensor, input_pos: torch.Tensor, cfg_scale: float, **sampling_kwargs):
-    print(f"At prefill stage, input_pos is: {input_pos}")
+    # print(f"At prefill stage, input_pos is: {input_pos}")
     if cfg_scale > 1.0:
         logits = model.forward_reference(None, None, camera_params, cond_idx, input_pos)
         logits_combined = logits
@@ -143,7 +143,7 @@ def decode_n_tokens(
     cfg_flag = True
     assert cam_pointer >= 1, "cam_pointer should be at least 1"
     for i in range(num_new_tokens):
-        print(f"At autoregression stage, at step {i}, input_pos is: {input_pos}, cam_pointer is: {cam_pointer}")
+        # print(f"At autoregression stage, at step {i}, input_pos is: {input_pos}, cam_pointer is: {cam_pointer}")
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
             if cfg_interval > -1 and i > cfg_interval:
                 cfg_flag = False
@@ -170,7 +170,7 @@ def decode_n_tokens_multi(
     new_tokens, new_probs = [], []
     cfg_flag = True
     for i in range(0, num_new_tokens, spe_token_num):
-        print(f"At autoregression parallel stage, at step {i}, input_pos is: {input_pos}, cam_pointer is: {cam_pointer}")
+        # print(f"At autoregression parallel stage, at step {i}, input_pos is: {input_pos}, cam_pointer is: {cam_pointer}")
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
             if cfg_interval > -1 and i > cfg_interval:
                 cfg_flag = False
@@ -201,7 +201,7 @@ def generate(model, cond, camera_params, max_new_tokens, emb_masks=None, cfg_sca
         camera_params_combined = torch.cat([camera_params, camera_params])
     else:
         cond_combined = cond
-    T = cond.shape[1]      
+    T = 1 #cond.shape[1]      
 
     T_new = T + max_new_tokens
     max_seq_length = T_new
