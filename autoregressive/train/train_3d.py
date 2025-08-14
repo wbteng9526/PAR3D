@@ -27,7 +27,7 @@ from utils.logger import create_logger
 from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.mvdataset import MultiViewDataset
-from autoregressive.models.gpt_3d import GPT_models
+from autoregressive.models.gpt_3d_no_spe import GPT_models
 import wandb
 
 #################################################################################
