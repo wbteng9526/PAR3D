@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from utils.drop_path import DropPath
-from tokenizer.vidtok.modules.model_3dcausal import EncoderCausal3DPadding
+# from tokenizer.vidtok.modules.model_3dcausal import EncoderCausal3DPadding
 
 
 def find_multiple(n: int, k: int):
@@ -71,6 +71,9 @@ class ModelArgs:
     norm_type: str = "layernorm"
     fix_encoder: bool = False
     fix_decoder: bool = False
+
+    K_list: tuple[int, ...] = (32, 32, 32)
+    counts_list: tuple[torch.Tensor, ...] = (None, None, None)
 
 
 #################################################################################
@@ -135,6 +138,51 @@ class MLP(nn.Module):
         x = self.act(x)
         x = self.fc2(x)
         return x
+    
+#################################################################################
+#                      Balanced Softmax                                         #
+#################################################################################
+
+class BalancedSoftmaxLoss(nn.Module):
+    """
+    CE on logits + log(counts). counts 以 EMA 方式在线估计或用先验初始化。
+    """
+    def __init__(self, K: int, label_smoothing: float = 0.0, init_counts: torch.Tensor | None = None):
+        super().__init__()
+        if init_counts is None:
+            init_counts = torch.ones(K)  # 均匀先验
+        init_counts = init_counts.float().clamp_min(1.0)
+        self.register_buffer("counts", init_counts)          # [K]
+        self.eps = label_smoothing
+
+    @torch.no_grad()
+    def update_counts(self, y: torch.Tensor, momentum: float = 0.05):
+        """
+        用当前 batch 标签直方图做 EMA：counts <- (1-m)*counts + m*hist
+        y: [N] (long)
+        """
+        K = self.counts.numel()
+        hist = torch.bincount(y, minlength=K).float().to(self.counts.device)
+        self.counts.mul_(1 - momentum).add_(momentum * hist)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, reduction: str = "mean"):
+        """
+        logits: [N, K] （未做 softmax 的原始 logit）
+        target: [N]
+        """
+        # logits + log(counts) 实现 Balanced Softmax
+        log_prior = torch.log(self.counts + 1e-12)                  # [K]
+        z = logits + log_prior                                      # [N, K]
+        logp = F.log_softmax(z, dim=-1)                             # [N, K]
+
+        if self.eps > 0:  # Label Smoothing
+            nll = F.nll_loss(logp, target, reduction=reduction)
+            smooth = -logp.mean(dim=-1)
+            smooth = smooth.mean() if reduction == "mean" else smooth.sum()
+            return (1 - self.eps) * nll + self.eps * smooth
+        else:
+            return F.nll_loss(logp, target, reduction=reduction)
+        
 
 class RVQHeads(nn.Module):
     def __init__(self, d_model: int, K_list: list[int]):
@@ -155,6 +203,52 @@ class RVQHeads(nn.Module):
             loss = torch.stack(losses, dim=-1) # [N, M]
         return loss, logits_list
 
+
+class RVQHeadsBalanced(nn.Module):
+    """
+    多段 RVQ 头。每段一个 Linear + BalancedSoftmaxLoss（可带 LS）。
+    """
+    def __init__(self, d_model: int, K_list: list[int],
+                 label_smoothing: float = 0.0,
+                 init_counts_list: list[torch.Tensor] | None = None):
+        super().__init__()
+        self.M = len(K_list)
+        self.heads = nn.ModuleList([nn.Linear(d_model, Km) for Km in K_list])
+        if init_counts_list is None:
+            init_counts_list = [None] * self.M
+        self.losses = nn.ModuleList([
+            BalancedSoftmaxLoss(Km, label_smoothing, init_counts_list[m])
+            for m, Km in enumerate(K_list)
+        ])
+
+    @torch.no_grad()
+    def update_priors(self, y_parts: torch.Tensor, momentum: float = 0.05):
+        # y_parts: [N, M]
+        for m in range(self.M):
+            self.losses[m].update_counts(y_parts[:, m], momentum)
+
+    def forward(self, h: torch.Tensor, y_parts: torch.Tensor,
+                update_prior: bool = False, momentum: float = 0.05,
+                reduction: str = "mean"):
+        """
+        h:       [N, D]       —— 只取“条件位”的隐藏态
+        y_parts: [N, M] (long)—— 每段的目标 id
+        """
+        if update_prior:
+            self.update_priors(y_parts, momentum)
+
+        per_head_losses = []
+        for m in range(self.M):
+            logits_m = self.heads[m](h)                   # [N, K_m]
+            loss_m = self.losses[m](logits_m, y_parts[:, m], reduction=reduction)
+            per_head_losses.append(loss_m)
+
+        if reduction == "mean":
+            return sum(per_head_losses) / self.M
+        elif reduction == "sum":
+            return sum(per_head_losses)
+        else:
+            return torch.stack(per_head_losses, dim=-1)    # [N, M]
 
 #################################################################################
 #                                  GPT Model                                    #
@@ -303,22 +397,22 @@ class Transformer(nn.Module):
         # self.spe_tok_embeddings = SpecialTokenEmbedding(self.spe_token_num * 2, config.dim)
 
         # camera causal encoder
-        self.camera_encoder = EncoderCausal3DPadding(
-            double_z=config.double_z,
-            z_channels=config.dim,
-            in_channels=config.in_channels,
-            out_ch=config.out_ch,
-            ch=config.ch,
-            ch_mult=config.ch_mult,
-            time_downsample_factor=config.time_downsample_factor,
-            num_res_blocks=config.num_res_blocks,
-            dropout=config.dropout,
-            use_checkpoint=config.use_checkpoint,
-            init_pad_mode=config.init_pad_mode,
-            norm_type=config.norm_type,
-            fix_encoder=config.fix_encoder,
-            fix_decoder=config.fix_decoder,
-        )
+        # self.camera_encoder = EncoderCausal3DPadding(
+        #     double_z=config.double_z,
+        #     z_channels=config.dim,
+        #     in_channels=config.in_channels,
+        #     out_ch=config.out_ch,
+        #     ch=config.ch,
+        #     ch_mult=config.ch_mult,
+        #     time_downsample_factor=config.time_downsample_factor,
+        #     num_res_blocks=config.num_res_blocks,
+        #     dropout=config.dropout,
+        #     use_checkpoint=config.use_checkpoint,
+        #     init_pad_mode=config.init_pad_mode,
+        #     norm_type=config.norm_type,
+        #     fix_encoder=config.fix_encoder,
+        #     fix_decoder=config.fix_decoder,
+        # )
 
 
         # transformer blocks
@@ -354,7 +448,7 @@ class Transformer(nn.Module):
         
         # Adjust group mask construction for interleaved tokens
         for i in range(0, (doubled_max_len) // (group_size)):
-            start = 2 * self.ar_token_num + i * (group_size)
+            start = 2 * self.ar_token_num + i * (group_size) + self.cls_token_num
             end = start + group_size
             group_mask[start:end, :end] = True
         self.group_mask = group_mask
@@ -367,6 +461,7 @@ class Transformer(nn.Module):
 
         # Optional for RVQ
         # self.rvq_heads = RVQHeads(config.dim, [32, 32, 32]) # vocab_size = 32768 = 32 * 32 * 32
+        # self.rvq_heads = RVQHeadsBalanced(config.dim, K_list=config.K_list, label_smoothing=0.1, init_counts_list=config.counts_list)
 
 
     def initialize_weights(self):        
@@ -399,7 +494,7 @@ class Transformer(nn.Module):
 
         group_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
         group_mask[:, 0] = True
-        group_size = (self.spe_token_num + 1) * 2
+        group_size = self.ar_token_num
         # Adjust for interleaved tokens in cache setup
         for i in range(0, (self.max_seq_length) // (group_size)):
             start = 2 * self.ar_token_num + i * (group_size)
@@ -425,16 +520,17 @@ class Transformer(nn.Module):
         input_pos:  Optional[torch.Tensor] = None, 
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-        valid: Optional[torch.Tensor] = None
+        valid: Optional[torch.Tensor] = None,
+        do_ema: bool = False
     ):
         if idx is not None and cond_idx is not None: # training or naive inference
             # Process camera tensor through camera encoder
-            cam_encoded = self.camera_encoder(cam)
-            b, dim, v, h, w = cam_encoded.shape
-            cam_encoded = cam_encoded.permute(0, 2, 3, 4, 1).contiguous()  # b x v x h x w x dim
+            # cam_encoded = self.camera_encoder(cam)
+            # b, dim, v, h, w = cam_encoded.shape
+            cam = cam.permute(0, 2, 3, 4, 1).contiguous()  # b x v x h x w x dim
             
             # Apply same permutation as idx to camera tokens
-            cam_tokens = permute_token(cam_encoded, self.config)    
+            cam_tokens = permute_token(cam, self.config)    
             
             idx = permute_token(idx, self.config)
             if self.training and targets is None:
@@ -500,7 +596,7 @@ class Transformer(nn.Module):
                 
             # Select only the idx token positions from interleaved sequence
             logits = logits[:, valid_indices].contiguous()
-            # hidden_states = h[:, start_idx:(start_idx + self.block_size * 2):2].contiguous()
+            # hidden_states = h[:, valid_indices].contiguous()
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -511,8 +607,9 @@ class Transformer(nn.Module):
         elif targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             # apply rvq
-            # y_parts = split_to_parts(targets, [32, 32, 32])
-            # loss, _ = self.rvq_heads(hidden_states, y_parts, reduction="mean")
+            # y_parts = split_to_parts(targets.reshape(-1), self.config.K_list)
+            # print(y_parts.shape, hidden_states.reshape(-1, self.config.dim).shape)
+            # loss = self.rvq_heads(hidden_states.reshape(-1, self.config.dim), y_parts, reduction="mean", momentum=0.05, update_prior=do_ema)
 
         return logits, loss
     
@@ -547,6 +644,11 @@ class Transformer(nn.Module):
             # need to interleave with previous camera tokens
             token_embeddings = interleave_tokens(prev_cam_token, token_embeddings)
             token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
+        elif prev_idx.shape[1] > 1 and not self.start:
+            token_embeddings = self.tok_embeddings(prev_idx)
+            token_embeddings = interleave_tokens(prev_cam_token, token_embeddings)
+            token_embeddings = torch.cat([token_embeddings, cur_cam_token], dim=1)
+            self.start = True
         else:
             token_embeddings = self.tok_embeddings(prev_idx)
             token_embeddings = interleave_tokens_per_token(
@@ -573,6 +675,7 @@ class Transformer(nn.Module):
         
         # output layers
         h = self.norm(h)
+        # logits_list = [head(h) for head in self.rvq_heads.heads]
         logits = self.output(h).float()
 
         return logits
@@ -759,7 +862,7 @@ def GPT_3B(**kwargs):
     return Transformer(ModelArgs(n_layer=24, n_head=32, dim=3200, **kwargs)) # 3.1B
 
 def GPT_1B(**kwargs):
-    return Transformer(ModelArgs(n_layer=22, n_head=40, dim=2560, **kwargs)) # 1.2B
+    return Transformer(ModelArgs(n_layer=22, n_head=32, dim=2048, **kwargs)) # 1.2B
 
 ### class-conditional
 def GPT_XXXL(**kwargs):

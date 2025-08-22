@@ -28,8 +28,7 @@ from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from utils.lr_scheduler import get_scheduler
 from dataset.mvdataset import MultiViewDataset
-from autoregressive.models.gpt_3d_no_spe import GPT_models
-from autoregressive.train.train_cam_ae import PluckerTokenModel, CosineWithWarmup
+from autoregressive.models.gpt_prope import GPT_models
 import wandb
 
 #################################################################################
@@ -132,7 +131,7 @@ def main(args):
     latent_size = args.image_size // args.downsample_size
     # logger.info(f"The latent size is: {latent_size}")
     # logger.info(f"The block size is: {latent_size ** 2 * args.temporal_size}")
-    K_list, counts_list = load_init_counts_from_pt(args.init_counts_path, device, ptdtype)
+    # K_list, counts_list = load_init_counts_from_pt(args.init_counts_path, device, ptdtype)
     model = GPT_models[args.gpt_model](
         vocab_size=args.vocab_size,
         block_size=latent_size ** 2 * args.temporal_size,
@@ -143,8 +142,8 @@ def main(args):
         token_dropout_p=args.token_dropout_p,
         spe_token_num=args.spe_token_num,
         ar_token_num=args.ar_token_num,
-        K_list=K_list,
-        counts_list=counts_list,
+        # K_list=K_list,
+        # counts_list=counts_list,
     ).to(device)
     logger.info(f"GPT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -157,14 +156,6 @@ def main(args):
     clip_model = CLIPVisionModelWithProjection.from_pretrained(args.clip_ckpt).to(device)
     clip_model.eval()
     for param in clip_model.parameters():
-        param.requires_grad = False
-
-    # load camera model
-    camera_model = PluckerTokenModel(z=1280, model_type="ae", base=128, res_type="vanilla", beta=0.1).to(device)
-    camera_model_ckpt = torch.load(args.camera_model_path, map_location="cpu", weights_only=False)
-    camera_model.load_state_dict(camera_model_ckpt["model"])
-    camera_model.eval()
-    for param in camera_model.parameters():
         param.requires_grad = False
 
     # Setup optimizer
@@ -237,11 +228,9 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, cam, clip_input in loader:
-            x, cam, clip_input = x.to(device, non_blocking=True), cam.to(device, non_blocking=True), clip_input.to(device, non_blocking=True)
-            cam_token = camera_model.encoder(cam)
+        for x, viewmats, Ks, clip_input in loader:
+            x, viewmats, Ks, clip_input = x.to(device, non_blocking=True), viewmats.to(device, non_blocking=True), Ks.to(device, non_blocking=True), clip_input.to(device, non_blocking=True)
             cond_input = clip_model(clip_input).image_embeds
-            ar_token_num = args.ar_token_num
             # logger.info(f"The shape of input x is: {x.shape}")
             # logger.info(f"The shape of input cam is: {cam.shape}")
             # logger.info(f"The shape of input cond_input is: {cond_input.shape}")
@@ -259,7 +248,7 @@ def main(args):
       
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 # _, loss = model(cond_idx=cond_input, idx=z_indices[:,:-1], targets=z_indices)
-                _, loss = model(cond_idx=cond_input, idx=x, cam=cam_token, do_ema=train_steps < args.ema_end_steps)
+                _, loss = model(cond_idx=cond_input, idx=x, viewmats=viewmats, Ks=Ks)
             # backward pass, with gradient scaling if training in fp16         
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
@@ -368,8 +357,6 @@ if __name__ == "__main__":
     # rvq
     parser.add_argument("--init-counts-path", type=str, default=None, help="path to the init counts")
     parser.add_argument("--ema-end-steps", type=int, default=500, help="end steps of ema training")
-    # camera model
-    parser.add_argument("--camera-model-path", type=str, default=None, help="path to the camera model")
     # training
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)

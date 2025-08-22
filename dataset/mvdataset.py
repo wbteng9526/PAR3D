@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 import numpy as np
 from transformers import CLIPImageProcessor
 from PIL import Image
-from utils.geometry import get_plucker_coordinates
+from utils.geometry import get_plucker_coordinates, compress_16_to_4_karcher, compress_16_to_4_geodesic
 from dataset.augmentation import center_crop_arr
 import random
 
@@ -61,10 +61,14 @@ def process_transform_json(filename: Path, dataset_name: str, image_size: int, s
     return extrinsics, intrinsics
 
 class MultiViewDataset(Dataset):
-    def __init__(self, args):
+    def __init__(self, args, train=True):
         super().__init__()
         self.root = args.data_path
-        with open(args.global_index_file, 'r') as f:
+        if train:
+            global_index_file = os.path.join(args.data_path, "global_index_train.txt")
+        else:
+            global_index_file = os.path.join(args.data_path, "global_index_val.txt")
+        with open(global_index_file, 'r') as f:
             self.global_index = [line.strip() for line in f.readlines()]
         
         self.feature_extractor = CLIPImageProcessor.from_pretrained(args.clip_ckpt)
@@ -97,10 +101,46 @@ class MultiViewDataset(Dataset):
                 [self.image_size, self.image_size]
         )
         # camera_matrix = torch.cat([extrinsics[:, :3, :], intrinsics], dim=-1)
+        # viewmats = compress_16_to_4_geodesic(extrinsics_rel)
+        
         clip_input = self.feature_extractor(images=Image.open(first_image_file).convert("RGB"), return_tensors="pt").pixel_values[0]
 
         return indices[1:], plucker_coords, clip_input
 
+
+class MultiViewCamDataset(Dataset):
+    def __init__(self, args, train=True):
+        super().__init__()
+        self.root = args.data_path
+        if train:
+            global_index_file = os.path.join(args.data_path, "global_index_train.txt")
+        else:
+            global_index_file = os.path.join(args.data_path, "global_index_val.txt")
+        with open(global_index_file, 'r') as f:
+            self.global_index = [line.strip() for line in f.readlines()]
+        
+        self.image_size = args.image_size
+    
+    def __len__(self):
+        return len(self.global_index)
+    
+    def __getitem__(self, idx):
+        data_index = self.global_index[idx]
+        dataset_name = data_index.split("/")[0]
+        transform_file = Path(self.root) / data_index / "transforms.json"
+
+        extrinsics, intrinsics = process_transform_json(transform_file, dataset_name, self.image_size)
+        # get plucker coordinates (ray embeddings)
+        extrinsics_src = extrinsics[0]
+
+        plucker_coords = get_plucker_coordinates(
+                extrinsics_src,
+                extrinsics,
+                intrinsics,
+                [self.image_size, self.image_size]
+        )
+  
+        return plucker_coords
 
 class RE10KVideoEvalDataset(Dataset):
     def __init__(self, args):

@@ -5,10 +5,11 @@ set -x
 export node_rank=0  # this is the first and only node
 export master_addr="localhost"  # running on local machine
 export master_port=29500  # can be any free port
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 torchrun \
---nnodes=1 --nproc_per_node=8 --node_rank=0 \
+--nnodes=1 --nproc_per_node=4 --node_rank=0 \
 --master_addr=$master_addr --master_port=$master_port \
 autoregressive/train/train_3d.py \
 --cloud-save-path /wekafs/ict/wenbinte/projects/PAR3D/GPT-XL-no-spe \
@@ -22,8 +23,8 @@ autoregressive/train/train_3d.py \
 --temporal-size 4 \
 --downsample-size 8 \
 --gpt-model GPT-XL \
---global-batch-size 16 \
---wandb-project PAR3D_training \
+--global-batch-size 8 \
+--wandb-project PAR3D_debug \
 --vocab-size 32768 \
 --lr-scheduler-type cosine \
 --num-warmup-steps 10000 \
@@ -31,6 +32,6 @@ autoregressive/train/train_3d.py \
 --num-cycles 0.5 \
 --lr 5e-4 \
 --beta2 0.95 \
---init-counts-path /wekafs/ict/wenbinte/projects/PAR3D/init_counts/rvq32x32x32.pt \
---camera-model-path /wekafs/ict/wenbinte/projects/PAR3D/cam_ae/ckpt_best.pt
-# --gpt-ckpt /wekafs/ict/wenbinte/projects/PAR3D/GPT-1B-no-spe-rvq-init-counts/0450000.pt
+--no-compile \
+--camera-model-path /wekafs/ict/wenbinte/projects/PAR3D/cam_ae/ckpt_best.pt \
+--init-counts-path /wekafs/ict/wenbinte/projects/PAR3D/init_counts/rvq32x32x32.pt

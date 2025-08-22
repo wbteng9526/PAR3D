@@ -246,3 +246,121 @@ def get_plucker_coordinates(
     plucker = torch.cat((rays, torch.cross(centers, rays, dim=-1)), dim=-1)
     plucker = plucker.permute(2, 0, 1).reshape(-1, plucker.shape[0], *target_size)
     return plucker
+
+
+def so3_log(R):
+    # R: [...,3,3]
+    cos_theta = (R.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0
+    cos_theta = cos_theta.clamp(-1+1e-7, 1-1e-7)
+    theta = torch.acos(cos_theta)
+    W = (R - R.transpose(-1, -2)) / 2.0
+    w = torch.stack([W[...,2,1], W[...,0,2], W[...,1,0]], dim=-1)  # [...,3]
+    s = torch.sin(theta)[..., None]
+    small = theta.abs() < 1e-5
+    coef = torch.where(small, 0.5 - (theta**2)[...,None]/12.0, theta[...,None]/(2.0*s + 1e-12))
+    return coef * w
+
+def so3_exp(w):
+    # w: [...,3]
+    theta = torch.linalg.norm(w, dim=-1, keepdim=True)
+    small = theta < 1e-5
+    k = torch.where(small, 1.0 + theta**2/6.0, torch.sin(theta)/ (theta+1e-12))
+    kk = torch.where(small, 0.5 - theta**2/24.0, (1 - torch.cos(theta))/ (theta**2+1e-12))
+    wx, wy, wz = w[...,0], w[...,1], w[...,2]
+    O = torch.zeros_like(wx)
+    W = torch.stack([
+        torch.stack([O,   -wz,  wy], dim=-1),
+        torch.stack([wz,   O,  -wx], dim=-1),
+        torch.stack([-wy, wx,   O], dim=-1),
+    ], dim=-2)
+    I = torch.eye(3, device=w.device, dtype=w.dtype).expand(W.shape)
+    R = I + k[...,None]*W + kk[...,None]*W@W
+    return R
+
+def se3_log(T):
+    # T: [...,4,4]
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+    w = so3_log(R)                     # [...,3]
+    theta = torch.linalg.norm(w, dim=-1, keepdim=True)
+    small = theta < 1e-5
+    wx, wy, wz = w[...,0], w[...,1], w[...,2]
+    O = torch.zeros_like(wx)
+    W = torch.stack([
+        torch.stack([O,   -wz,  wy], dim=-1),
+        torch.stack([wz,   O,  -wx], dim=-1),
+        torch.stack([-wy, wx,   O], dim=-1),
+    ], dim=-2)                          # [...,3,3]
+    I = torch.eye(3, device=T.device, dtype=T.dtype).expand(W.shape)
+    A = torch.where(small, 1.0 - theta**2/6.0, (1 - torch.cos(theta)) / (theta**2 + 1e-12)).unsqueeze(-1)
+    B = torch.where(small, 0.5 - theta**2/24.0, (theta - torch.sin(theta)) / (theta**3 + 1e-12)).unsqueeze(-1)
+    V = I + A*W + B*(W@W)               # [...,3,3]
+    v = torch.linalg.solve(V, t.unsqueeze(-1)).squeeze(-1)  # [...,3]
+    xi = torch.cat([v, w], dim=-1)      # [...,6]
+    return xi
+
+def se3_exp(xi):
+    # xi: [...,6] -> T: [...,4,4]
+    v, w = xi[..., :3], xi[..., 3:]
+    R = so3_exp(w)
+    theta = torch.linalg.norm(w, dim=-1, keepdim=True)
+    small = theta < 1e-5
+    wx, wy, wz = w[...,0], w[...,1], w[...,2]
+    O = torch.zeros_like(wx)
+    W = torch.stack([
+        torch.stack([O,   -wz,  wy], dim=-1),
+        torch.stack([wz,   O,  -wx], dim=-1),
+        torch.stack([-wy, wx,   O], dim=-1),
+    ], dim=-2)
+    I = torch.eye(3, device=xi.device, dtype=xi.dtype).expand(W.shape)
+    A = torch.where(small, 1.0 - theta**2/6.0, (1 - torch.cos(theta)) / (theta**2 + 1e-12)).unsqueeze(-1)
+    B = torch.where(small, 0.5 - theta**2/24.0, (theta - torch.sin(theta)) / (theta**3 + 1e-12)).unsqueeze(-1)
+    V = I + A*W + B*(W@W)               # [...,3,3]
+    t = (V @ v.unsqueeze(-1)).squeeze(-1)
+    T = torch.zeros((*R.shape[:-2], 4, 4), device=xi.device, dtype=xi.dtype)
+    T[..., :3, :3] = R
+    T[..., :3, 3] = t
+    T[..., 3, 3] = 1.0
+    return T
+
+def se3_inv(T):
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+    Ti = torch.zeros_like(T)
+    Ti[..., :3, :3] = R.transpose(-1, -2)
+    Ti[..., :3, 3]  = -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)
+    Ti[..., 3, 3]   = 1.0
+    return Ti
+
+def karcher_mean_se3(Ts, iters=10):
+    # Ts: [N,4,4]
+    Tbar = Ts[Ts.shape[0]//2].clone()  # 以中位初始化更稳
+    for _ in range(iters):
+        xi = se3_log(se3_inv(Tbar) @ Ts)  # [N,6]
+        delta = xi.mean(dim=0)            # [6]
+        Tbar = Tbar @ se3_exp(delta)
+        if torch.linalg.norm(delta) < 1e-10:
+            break
+    return Tbar
+
+def compress_16_to_4_karcher(Ts):
+    # Ts: [16,4,4]
+    outs = []
+    for k in range(4):
+        seg = Ts[k*4:(k+1)*4]
+        outs.append(karcher_mean_se3(seg))
+    return torch.stack(outs, dim=0)  # [4,4,4]
+
+def se3_geodesic_interpolate(Ti, Tj, alpha):
+    # alpha ∈ [0,1]
+    return Ti @ se3_exp(alpha * se3_log(se3_inv(Ti) @ Tj))
+
+def compress_16_to_4_geodesic(Ts):
+    # 取段中心时间 1.5, 5.5, 9.5, 13.5
+    times = torch.tensor([1.5, 5.5, 9.5, 13.5], device=Ts.device, dtype=Ts.dtype)
+    outs = []
+    for s in times:
+        k = int(torch.floor(s).item())
+        a = (s - k).item()
+        outs.append(se3_geodesic_interpolate(Ts[k], Ts[min(k+1, 15)], a))
+    return torch.stack(outs, dim=0)  # [4,4,4]

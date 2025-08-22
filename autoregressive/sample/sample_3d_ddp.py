@@ -28,12 +28,22 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from tokenizer.vidtok.scripts.inference_evaluate import load_model_from_config
-from autoregressive.models.gpt_3d import GPT_models, permute_token
-from autoregressive.models.generate_3d import generate
+from autoregressive.models.gpt_3d_no_spe import GPT_models, permute_token
+from autoregressive.models.generate_3d_no_spe import generate
 from dataset.mvdataset import RE10KVideoEvalDataset
+from autoregressive.train.train_cam_ae import PluckerTokenModel, CosineWithWarmup
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
+def load_init_counts_from_pt(path, device, dtype):
+    ckpt = torch.load(path, map_location="cpu")
+    K_list = ckpt.get("K_list", [32, 32, 32])
+    counts_list = ckpt["counts"]                     # List[Tensor], 每个形状 [32]
+    # 基本校验与转 dtype/device
+    assert len(counts_list) == len(K_list)
+    assert all(c.numel() == K for c, K in zip(counts_list, K_list))
+    # 避免 0 计数（如果你离线时已做过 Laplace，就不会为 0）
+    counts_list = [c.clone().clamp_min(1.0).to(device, dtype=dtype) for c in counts_list]
+    return K_list, counts_list
 
 
 def main(args):
@@ -64,9 +74,18 @@ def main(args):
     clip_model = CLIPVisionModelWithProjection.from_pretrained(args.clip_ckpt).to(device)
     clip_model.eval()
 
+    camera_model = PluckerTokenModel(z=1280, model_type="ae", base=128, res_type="vanilla", beta=0.1).to(device)
+    camera_model_ckpt = torch.load(args.camera_model_path, map_location="cpu", weights_only=False)
+    camera_model.load_state_dict(camera_model_ckpt["model"])
+    camera_model.eval()
+
     # create and load gpt model
     precision = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.precision]
     latent_size = args.image_size // args.downsample_size
+    if args.init_counts_path is not None:
+        K_list, counts_list = load_init_counts_from_pt(args.init_counts_path, device, precision)
+    else:
+        K_list, counts_list = None, None
     gpt_model = GPT_models[args.gpt_model](
         vocab_size=args.vocab_size,
         block_size=latent_size ** 2 * args.temporal_size,
@@ -77,6 +96,8 @@ def main(args):
         token_dropout_p=args.token_dropout_p,
         spe_token_num=args.spe_token_num,
         ar_token_num=args.ar_token_num,
+        K_list=K_list,
+        counts_list=counts_list,
     ).to(device=device, dtype=precision)
 
     checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
@@ -150,14 +171,17 @@ def main(args):
         
         
         with torch.no_grad(), torch.cuda.amp.autocast(dtype=precision):
-            cam_encoded = gpt_model.camera_encoder(plucker_coords)
-            cam_encoded = cam_encoded.permute(0, 2, 3, 4, 1).contiguous()
-            cam_encoded = permute_token(cam_encoded, args)
+            # cam_encoded = gpt_model.camera_encoder(plucker_coords)
+            # cam_encoded = cam_encoded.permute(0, 2, 3, 4, 1).contiguous()
+            # cam_encoded = permute_token(cam_encoded, args)
+            cam_token = camera_model.encoder(plucker_coords)
+            cam_token = cam_token.permute(0, 2, 3, 4, 1).contiguous()
+            cam_token = permute_token(cam_token, args)
 
             index_sample = generate(
                 gpt_model, 
                 cond_input, #[:, None, :], 
-                cam_encoded, 
+                cam_token, 
                 max_new_tokens=latent_size ** 2 * args.temporal_size,
                 cfg_scale=args.cfg_scale,
                 temperature=args.temperature, top_k=args.top_k,
@@ -246,5 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--fps", type=int, default=8, help="fps of the video")
     parser.add_argument("--compute-metrics", action='store_true', default=False)
+    parser.add_argument("--init-counts-path", type=str, default=None, help="path to the init counts")
+    parser.add_argument("--camera-model-path", type=str, default=None)
     args = parser.parse_args()
     main(args)
